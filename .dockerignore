@@ -1,4 +1,4 @@
-# O Dockerfile não copia arquivos do projeto, mas o contexto de build
+# O Dockerfile copia somente patches/jev-router-1.6.0, mas o contexto de build
 # inteiro é enviado ao daemon. Mantenha segredos e estado local fora dele.
 
 .git

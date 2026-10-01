@@ -454,6 +454,10 @@ try {
     Check "relatorio: cliente desconhecido" ($report.efforts.client.effort -ceq "unknown" -and $report.efforts.client.source -ceq "unknown")
     Check "relatorio: comparacao com cliente nula" ($null -eq $report.efforts.baselineMatchesClient)
     Check "relatorio: recomendado nao aplicado" ($report.efforts.recommended.applied -eq $false -and $report.efforts.recommended.model -ceq "gpt-new")
+    $rec = $report.efforts.recommended
+    Check "relatorio: recomendado provider/tier" ($rec.provider -ceq $report.provider -and $rec.tier -ceq $report.tier)
+    Check "relatorio: recomendado configPath" ($rec.configPath -ceq "surfaces.$($report.provider).$($report.tier)")
+    Check "relatorio: recomendado configPatch" ($rec.configPatch.model -ceq "gpt-new" -and $rec.configPatch.effort -ceq $rec.effort -and @($rec.configPatch.PSObject.Properties.Name).Count -eq 2)
     Check "relatorio: sem campo current" ($null -eq $report.PSObject.Properties["current"])
     Check "relatorio: resumo baseline" ($report.baseline.effort -ceq "low" -and $report.baseline.model -ceq "gpt-6.1-sol")
     Check "relatorio: 2 combinacoes" (@($report.candidates).Count -eq 2)
@@ -461,7 +465,7 @@ try {
     Check "relatorio: resultados com effort" (@($report.results.candidate | Where-Object { $_.effort -ceq "medium" }).Count -eq 3)
     Check "relatorio: resultados baseline" (@($report.results.baseline).Count -eq 3)
     Check "relatorio: etapa 2 nao implementada" ($report.stage -eq 1 -and $report.stage2.implemented -eq $false)
-    Check "relatorio: nota sem 'aplicar'" ($report.note -match 'nao foi aplicado')
+    Check "relatorio: nota sem 'aplicar'" ($report.note -match 'nao foi aplicad')
     # Respostas vazias: nada passa; empate em 0/3 -> menor effort, sem promocao.
     Check "relatorio: melhor = low" ($report.candidate.effort -ceq "low" -and $report.efforts.recommended.effort -ceq "low" -and $report.recommendation -ceq "INCONCLUSIVO")
     Check "relatorio: sem promocao" (@($report.stage2.candidates).Count -eq 0)
@@ -490,7 +494,7 @@ try {
     Check "claude falso: haiku sem --effort" (@($recv | Where-Object { $_ -match 'claude-haiku' -and $_ -match '--effort' }).Count -eq 0)
     $reports = @(Get-ChildItem $reportsDir -Filter *.json | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
     $haikuReport = $reports | Where-Object { $_.tier -eq "fast" }
-    Check "claude falso: relatorio haiku" ($haikuReport.efforts.baseline.effort -ceq "not-applicable" -and $haikuReport.efforts.recommended.effort -ceq "not-applicable")
+    Check "claude falso: relatorio haiku" ($haikuReport.efforts.baseline.effort -ceq "not-applicable" -and $null -eq $haikuReport.efforts.recommended.effort -and $null -eq $haikuReport.efforts.recommended.configPatch.effort -and $haikuReport.efforts.recommended.configPatch.model -ceq $haikuReport.efforts.recommended.model)
 }
 finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue

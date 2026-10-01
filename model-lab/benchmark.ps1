@@ -167,6 +167,35 @@ function Test-Effort($Provider, $Effort) {
     return ($EffortAllowlist[$Provider] -ccontains $Effort)
 }
 
+# Sugestao no formato do target do router (surfaces.<provider>.<tier>).
+# effort so entra quando esta na allowlist do provider; "cli-default" e
+# "not-applicable" viram null: o target fica sem effort e o router
+# preserva o effort do cliente. Nunca aplicada automaticamente.
+function New-RouterSuggestion($Provider, $Tier, $Model, $EffortLabel) {
+
+    $effort = $null
+
+    if (Test-Effort $Provider $EffortLabel) {
+        $effort = $EffortLabel
+    }
+
+    $target = [ordered]@{ model = $Model }
+
+    if ($null -ne $effort) {
+        $target.effort = $effort
+    }
+
+    return [ordered]@{
+        provider = $Provider
+        tier = $Tier
+        model = $Model
+        effort = $effort
+        applied = $false
+        configPath = "surfaces.$Provider.$Tier"
+        configPatch = $target
+    }
+}
+
 function Get-EffortRank($Provider, $Effort) {
 
     if ($null -eq $Effort) {
@@ -1322,8 +1351,8 @@ foreach ($candidateInfo in $pending) {
         provider = $provider
         tier = $tier
 
-        # Modelo que o router usa hoje neste tier. O router so troca
-        # modelo; ele nao define nem reescreve effort.
+        # Modelo que o router usa hoje neste tier. O effort do tier
+        # (surfaces.<provider>.<tier>.effort) fica em config/config.json.
         routerTierModel = $current
 
         efforts = [ordered]@{
@@ -1340,12 +1369,9 @@ foreach ($candidateInfo in $pending) {
             # true/false somente quando o effort do cliente e conhecido.
             baselineMatchesClient = $baselineMatchesClient
 
-            # Melhor combinacao do candidato. Sugestao: nada foi aplicado.
-            recommended = [ordered]@{
-                model = $candidate
-                effort = $best.effort
-                applied = $false
-            }
+            # Melhor combinacao do candidato, pronta para o target do
+            # router (configPath/configPatch). Sugestao: nada foi aplicado.
+            recommended = (New-RouterSuggestion $provider $tier $candidate $best.effort)
         }
 
         # Modelo atual medido com o effort baseline.
@@ -1363,7 +1389,7 @@ foreach ($candidateInfo in $pending) {
             candidates = $stage2Candidates
         }
 
-        note = "Etapa 1 e um filtro barato. Nenhuma alteracao foi feita no router nem nas configuracoes do Codex/Claude. O effort recomendado e apenas uma sugestao e nao foi aplicado."
+        note = "Etapa 1 e um filtro barato. Nenhuma alteracao foi feita no router nem nas configuracoes do Codex/Claude. A combinacao recomendada (modelo + effort) e apenas uma sugestao e nao foi aplicada."
 
         results = [ordered]@{
             baseline = $baselineResults
@@ -1388,7 +1414,7 @@ foreach ($candidateInfo in $pending) {
         Log "Candidato:   $candidate effort=$($combo.effort) $($combo.passed)/$($tierCases.Count), falhas $($combo.failures), media $($combo.averageMilliseconds)ms -> $($combo.versusBaseline)"
     }
 
-    Log "Recomendado: $candidate effort=$($best.effort) (sugestao; nao aplicado)"
+    Log "Recomendado: surfaces.$provider.$tier = $candidate effort=$($best.effort) (sugestao; nao aplicado)"
     Log "Decisao:     $recommendation"
     Log "Relatorio:   $reportFile"
 }

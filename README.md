@@ -19,16 +19,24 @@ OpenAI Codex ───────────►│                       │
                  ┌───────────────────┼───────────────────┐
                  ▼                   ▼                   ▼
                fast              balanced            frontier
+                 │                   │                   │
+                 ▼                   ▼                   ▼
+            modelo + effort     modelo + effort     modelo + effort
+                                     │
+                                     ▼
+                           requisição ao upstream
 ```
 
-O mapeamento padrão é:
+O mapeamento padrão (`config.example.json`) é:
 
 ```text
-mechanical → fast
-routine    → balanced
-complex    → frontier
-deep       → frontier
+mechanical → fast     → modelo do tier + effort low
+routine    → balanced → modelo do tier + effort medium
+complex    → frontier → modelo do tier + effort high
+deep       → frontier → modelo do tier + effort high
 ```
+
+O router define **o modelo e o reasoning effort** de cada requisição a partir do tier escolhido. Os valores vêm do `config.json` (veja [Effort por tier no router](#effort-por-tier-no-router)).
 
 O usuário continua usando normalmente:
 
@@ -53,6 +61,7 @@ Os wrappers instalados pelo projeto verificam silenciosamente se existe algum mo
 - reutiliza login oficial do Claude Code
 - reutiliza login oficial ChatGPT/Codex
 - seleção automática de tier pelo Jev
+- modelo **e** reasoning effort definidos pelo router por tier (patch versionado sobre o Jev Router 1.6.0)
 - Docker Compose
 - model watcher automático
 - busca por novos modelos a cada 24 horas
@@ -359,7 +368,7 @@ Três conceitos diferentes:
 | --- | --- | --- |
 | tier | nível de roteamento (`fast`, `balanced`, `frontier`) | `config\config.json` (router) |
 | modelo | modelo concreto atendendo o tier | `config\config.json` (router) |
-| effort | quanto raciocínio o modelo usa por requisição | cliente (Codex/Claude Code); no benchmark, `model-lab\efforts.json` |
+| effort | quanto raciocínio o modelo usa por requisição | `effort` do target em `config\config.json` (router); sem ele, o do cliente. No benchmark, `model-lab\efforts.json` |
 
 No benchmark e nos relatórios, quatro informações aparecem separadas:
 
@@ -368,7 +377,7 @@ No benchmark e nos relatórios, quatro informações aparecem separadas:
 | modelo atual do tier (`routerTierModel`) | modelo que o router usa hoje no tier | `pending-models.json` (registrado pelo watcher) |
 | effort baseline (`efforts.baseline`) | effort com que o modelo atual é medido na comparação | effort do cliente, quando declarado e `baselineFromClient: true`; senão `baseline` em `efforts.json` |
 | effort do cliente (`efforts.client`) | effort que o Codex/Claude usa no dia a dia | `model-lab\client-efforts.json` (local); `unknown` quando não declarado |
-| effort recomendado (`efforts.recommended`) | effort da melhor combinação do candidato | resultado do benchmark; **sugestão, nunca aplicado** (`applied: false`) |
+| recomendação (`efforts.recommended`) | `{provider, tier, model, effort}` da melhor combinação do candidato, com `configPath`/`configPatch` prontos para o `config.json` | resultado do benchmark; **sugestão, nunca aplicada** (`applied: false`) |
 
 O baseline só é igual ao effort do cliente quando o effort do cliente é conhecido. `efforts.baselineMatchesClient` mostra `true`/`false` nesse caso e `null` quando o effort do cliente é desconhecido.
 
@@ -458,16 +467,85 @@ Tokens de saída são registrados quando o próprio Claude Code os informa (`out
 
 Nada é aplicado automaticamente: nem tiers, nem modelos, nem effort. O watcher continua apenas registrando modelos novos em `pending-models.json`; os efforts testados vêm de `efforts.json` no momento do benchmark.
 
-## Limitação do router
+## Effort por tier no router
 
-O Jev Router (1.6.0) só substitui o campo `model` da requisição e pode remover campos (`omit`, por exemplo `output_config.effort` nos targets Haiku). Ele **não** define nem reescreve reasoning effort por tier, e uma chave `effort` em `config.json` seria ignorada silenciosamente, por isso ela não é usada.
+O Jev Router 1.6.0 original só troca o campo `model`. Este projeto aplica no build da imagem um patch versionado (`patches\jev-router-1.6.0`) que faz o router definir também o **reasoning effort** de cada requisição, conforme o tier escolhido:
 
-Na prática, o effort enviado é o que o cliente envia:
+```text
+Jev classifica → tier → target (modelo + effort) → requisição ao upstream
+```
 
-- Codex: `model_reasoning_effort` no seu `%USERPROFILE%\.codex\config.toml` (ou `/model` na sessão)
-- Claude Code: `--effort` ou a configuração de effort do próprio Claude Code
+Basta adicionar `effort` ao target em `config\config.json`:
 
-Esse mesmo effort vale para qualquer tier que o router escolher. O effort recomendado pelo benchmark é apenas uma sugestão: ele não é aplicado em lugar nenhum, e usá-lo exige uma alteração manual no cliente.
+```json
+"openai": {
+  "fast":     { "model": "gpt-6-luna",  "effort": "low",    "...": "..." },
+  "balanced": { "model": "gpt-6.1-sol", "effort": "medium", "...": "..." },
+  "frontier": { "model": "gpt-6-astra", "effort": "high",   "...": "..." }
+}
+```
+
+### Precedência
+
+1. `effort` do target no `config.json` → **sempre vence** o effort enviado pelo cliente.
+2. Target sem `effort` → o effort do cliente é preservado exatamente como veio (comportamento anterior).
+
+O effort do cliente continua vindo de `model_reasoning_effort` no Codex ou de `--effort`/configuração do Claude Code, e só vale nos tiers sem `effort`.
+
+### Específico por provider
+
+O campo e os valores aceitos são diferentes em cada provider e nunca são convertidos entre si:
+
+| Provider | Campo reescrito no body | Valores aceitos |
+| --- | --- | --- |
+| `openai` (Codex, `/v1/responses`) | `reasoning.effort` (demais campos de `reasoning` são preservados; um `reasoning_effort` enviado pelo cliente também é sobrescrito) | `low`, `medium`, `high`, `xhigh` |
+| `anthropic` (Claude Code, `/v1/messages`) | `output_config.effort` (demais campos de `output_config` e `thinking` são preservados) | `low`, `medium`, `high`, `xhigh`, `max` |
+
+- As allowlists são fixas e diferenciam maiúsculas (`Low` é inválido). Um valor fora delas, um valor não-string, `effort` num modelo sem suporte (`claude-haiku-*`) ou `effort` junto com um `omit` que removeria o campo **impedem o router de iniciar**, com a mensagem de erro indicando o target (o valor não é ecoado).
+- Modelos Haiku não recebem effort: deixe os targets Haiku sem `effort` (eles mantêm o `omit` de `output_config.effort`).
+- `count_tokens` nunca recebe effort.
+- O effort aplicado aparece no header de resposta `x-jev-effort` e no campo `effort` dos logs `route` e `done` do router.
+
+### Como o patch é aplicado
+
+O `Dockerfile` copia `patches\jev-router-1.6.0` e executa `apply.mjs`, que:
+
+- confere que o pacote instalado é exatamente `@ediri/jev-router@1.6.0`;
+- confere o SHA-256 de `src/router.mjs`, `src/config.mjs` e `src/types.d.ts` originais;
+- exige que cada trecho alterado exista exatamente uma vez;
+- só grava os arquivos depois de todas as verificações, e importa os módulos alterados para validar.
+
+Qualquer divergência (nova versão, upstream alterado, patch já aplicado) **falha o build** com uma mensagem clara, em vez de gerar comportamento incorreto. O mesmo patch inclui a correção existente do caminho `/backend-api/codex/responses` para o login ChatGPT.
+
+Para ativar depois de atualizar o repositório:
+
+```powershell
+docker compose up -d --build jev-router
+```
+
+Um `config.json` sem nenhum `effort` mantém exatamente o comportamento anterior.
+
+### Limitação: `complex` e `deep`
+
+O effort é definido por **tier**. Como `complex` e `deep` usam ambos o tier `frontier`, eles recebem o mesmo effort (por exemplo `high`). Para dar `xhigh` só a `deep`, seria preciso um quarto tier (por exemplo `deep` com `effort: "xhigh"`) e mapear `jev.labels.deep` para ele. Isso muda a semântica do roteamento (escalonamento e override de conteúdo sensível passam a ir para o tier mais alto), então avalie também `escalationCeiling: "frontier"`. O exemplo mantém três tiers.
+
+### Recomendação do benchmark
+
+`efforts.recommended` no relatório traz a combinação sugerida pronta para o router, por exemplo:
+
+```json
+{
+  "provider": "openai",
+  "tier": "balanced",
+  "model": "gpt-6.1-sol",
+  "effort": "low",
+  "applied": false,
+  "configPath": "surfaces.openai.balanced",
+  "configPatch": { "model": "gpt-6.1-sol", "effort": "low" }
+}
+```
+
+Ela **nunca é aplicada automaticamente**: para adotá-la, copie `configPatch` para o target indicado em `configPath` no seu `config.json` e reinicie o router. Quando o modelo não aceita effort (Haiku) ou nenhum effort foi enviado (`cli-default`), `effort` é `null` e `configPatch` contém só `model`.
 
 ---
 
@@ -529,6 +607,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\model-lab-effort.tes
 ```
 
 O script mostra o total de casos e falhas de cada parte (unidades e integração) e termina com código `1` se algum teste falhar. Os arquivos temporários ficam em `%TEMP%\jev-effort-test-<guid>` e são removidos ao final. Não precisa de `runtime\runtime-paths.json`, credenciais nem rede.
+
+Testes do effort no router (`node:test`): allowlists, reescrita do body por provider, precedência, recusa de configs inválidas e recusas do `apply.mjs` (versão errada, hash divergente). A parte de integração sobe o router patchado contra um upstream falso local, sem credenciais nem chamadas reais. O jeito mais simples é rodar dentro da imagem, sem rede:
+
+```powershell
+docker run --rm --network none `
+  -v "${PWD}/tests:/repo/tests:ro" `
+  -v "${PWD}/patches:/repo/patches:ro" `
+  -v "${PWD}/config/config.example.json:/repo/config/config.example.json:ro" `
+  jev-router-jev-router node --test /repo/tests/router-effort.test.mjs
+```
+
+No host (Node 22+), `node --test tests/router-effort.test.mjs` roda os testes unitários; os de integração exigem `JEV_ROUTER_PKG` apontando para uma cópia patchada do pacote e são pulados caso contrário.
 
 ---
 
@@ -629,6 +719,11 @@ jev-router/
 │   ├── watch.ps1
 │   └── reports/
 │
+├── patches/
+│   └── jev-router-1.6.0/
+│       ├── apply.mjs    (aplicado no build; falha se versão/hash divergirem)
+│       └── effort.mjs   (effort por target)
+│
 ├── runtime/
 │   └── .gitkeep
 │
@@ -638,7 +733,8 @@ jev-router/
 │   └── uninstall.ps1
 │
 ├── tests/
-│   └── model-lab-effort.tests.ps1
+│   ├── model-lab-effort.tests.ps1
+│   └── router-effort.test.mjs
 │
 ├── Dockerfile
 ├── compose.yaml
