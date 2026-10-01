@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "_comment": "Perfis de reasoning effort usados SOMENTE pelo benchmark (model-lab). O Jev Router nao le este arquivo e nao altera effort. baseline = effort com que o modelo atual do tier e medido (fallback quando o effort do cliente nao e conhecido). baselineFromClient = usar o effort declarado em client-efforts.json (local) como baseline. Valores aceitos sao limitados por allowlist fixa em benchmark.ps1; qualquer outro valor e descartado.",
+  "providers": {
+    "openai": {
+      "supportsEffort": true,
+      "baselineFromClient": true,
+      "baseline": {
+        "fast": "low",
+        "balanced": "low",
+        "frontier": "low"
+      },
+      "matrix": {
+        "fast": ["low"],
+        "balanced": ["low", "medium"],
+        "frontier": ["medium", "high"]
+      }
+    },
+    "anthropic": {
+      "supportsEffort": true,
+      "baselineFromClient": true,
+      "modelsWithoutEffort": ["claude-haiku-"],
+      "baseline": {
+        "fast": null,
+        "balanced": null,
+        "frontier": null
+      },
+      "matrix": {
+        "fast": [],
+        "balanced": ["low", "medium"],
+        "frontier": ["medium", "high"]
+      }
+    }
+  }
+}

@@ -32,6 +32,9 @@ model-lab/seen-models.json
 model-lab/pending-models.json
 model-lab/benchmark-cache.json
 
+# Effort declarado do cliente (especifico de cada maquina)
+model-lab/client-efforts.json
+
 # ------------------------------------------------------------
 # Logs
 # ------------------------------------------------------------

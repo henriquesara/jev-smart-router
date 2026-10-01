@@ -343,6 +343,132 @@ Nenhum resultado altera automaticamente o `config.json`: nenhum candidato muda o
 
 O benchmark só executa chamadas de modelo quando existe alguma pendência em `pending-models.json`; sem pendências, nenhuma chamada é feita.
 
+Para ver o que seria executado (combinações, argumentos e o que já está em cache) sem chamar nenhum modelo e sem alterar cache, pendências ou relatórios:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\model-lab\benchmark.ps1 -DryRun
+```
+
+---
+
+# Reasoning effort
+
+Três conceitos diferentes:
+
+| Conceito | O que é | Onde é definido |
+| --- | --- | --- |
+| tier | nível de roteamento (`fast`, `balanced`, `frontier`) | `config\config.json` (router) |
+| modelo | modelo concreto atendendo o tier | `config\config.json` (router) |
+| effort | quanto raciocínio o modelo usa por requisição | cliente (Codex/Claude Code); no benchmark, `model-lab\efforts.json` |
+
+No benchmark e nos relatórios, quatro informações aparecem separadas:
+
+| Termo | Significado | Origem |
+| --- | --- | --- |
+| modelo atual do tier (`routerTierModel`) | modelo que o router usa hoje no tier | `pending-models.json` (registrado pelo watcher) |
+| effort baseline (`efforts.baseline`) | effort com que o modelo atual é medido na comparação | effort do cliente, quando declarado e `baselineFromClient: true`; senão `baseline` em `efforts.json` |
+| effort do cliente (`efforts.client`) | effort que o Codex/Claude usa no dia a dia | `model-lab\client-efforts.json` (local); `unknown` quando não declarado |
+| effort recomendado (`efforts.recommended`) | effort da melhor combinação do candidato | resultado do benchmark; **sugestão, nunca aplicado** (`applied: false`) |
+
+O baseline só é igual ao effort do cliente quando o effort do cliente é conhecido. `efforts.baselineMatchesClient` mostra `true`/`false` nesse caso e `null` quando o effort do cliente é desconhecido.
+
+O effort é **específico de cada provider**. Os valores não são equivalentes entre OpenAI e Anthropic e nunca são comparados entre si:
+
+| Provider | Mecanismo usado no benchmark | Valores aceitos |
+| --- | --- | --- |
+| OpenAI (Codex) | `-c model_reasoning_effort="<effort>"` | `low`, `medium`, `high`, `xhigh` |
+| Anthropic (Claude Code) | `--effort <effort>` | `low`, `medium`, `high`, `xhigh`, `max` |
+
+Essas listas são allowlists fixas em `benchmark.ps1`. `efforts.json` só escolhe valores dentro delas; qualquer outro valor (inclusive maiúsculas, aspas ou texto extra) é descartado com aviso, sem ser ecoado no log, e nunca vira argumento de linha de comando.
+
+Modelos sem suporte a effort (por exemplo `claude-haiku-*`, listados em `modelsWithoutEffort`) rodam sem nenhuma flag e aparecem no relatório como `not-applicable`. Quando o provider suporta effort mas nenhum valor é enviado, o relatório mostra `cli-default` (o CLI decide; o valor real não é conhecido pelo benchmark).
+
+## efforts.json
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "openai": {
+      "supportsEffort": true,
+      "baselineFromClient": true,
+      "baseline": { "fast": "low", "balanced": "low", "frontier": "low" },
+      "matrix": {
+        "fast": ["low"],
+        "balanced": ["low", "medium"],
+        "frontier": ["medium", "high"]
+      }
+    },
+    "anthropic": {
+      "supportsEffort": true,
+      "baselineFromClient": true,
+      "modelsWithoutEffort": ["claude-haiku-"],
+      "baseline": { "fast": null, "balanced": null, "frontier": null },
+      "matrix": { "fast": [], "balanced": ["low", "medium"], "frontier": ["medium", "high"] }
+    }
+  }
+}
+```
+
+- `baseline`: effort fixo para medir o modelo atual do tier quando o effort do cliente não é conhecido. `null` = nenhum effort enviado (`cli-default`). Não representa o effort do seu cliente. A chave antiga `current` ainda é aceita com o mesmo significado.
+- `baselineFromClient`: com `true` e effort do cliente declarado, o modelo atual é medido com o effort do cliente em vez de `baseline`.
+- `matrix`: efforts testados para o **candidato** em cada tier (no máximo 3 por tier). Lista vazia = o candidato roda com o mesmo effort do baseline.
+- `supportsEffort: false` desliga completamente o envio de effort para o provider.
+- Sem `efforts.json`, o benchmark mantém o comportamento anterior: baseline OpenAI `low`, Claude sem `--effort`.
+
+## client-efforts.json
+
+Arquivo **local e opcional** (ignorado pelo Git) que declara o effort que cada cliente usa no dia a dia. Como o valor depende de cada máquina, ele não fica no repositório:
+
+```powershell
+Copy-Item .\model-lab\client-efforts.example.json .\model-lab\client-efforts.json
+```
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "openai": { "effort": "medium" },
+    "anthropic": { "effort": null }
+  }
+}
+```
+
+- Use o mesmo valor configurado no cliente (por exemplo `model_reasoning_effort` do Codex). `null` = desconhecido.
+- O benchmark **não** lê nem altera `%USERPROFILE%\.codex\config.toml` ou as configurações do Claude Code: esses arquivos podem conter tokens, por isso o effort do cliente é sempre declarado explicitamente.
+- Valores fora da allowlist do provider são descartados com aviso (sem ecoar o valor) e tratados como desconhecidos.
+- Sem o arquivo, o effort do cliente aparece como `unknown` e o baseline vem de `efforts.json`.
+
+Custo por candidato na etapa 1: `casos × (1 + efforts da matriz)`, descontando o que já estiver em cache. Com 3 casos e `["low", "medium"]`, são até 9 chamadas.
+
+## Como o benchmark compara
+
+O modelo atual do tier, medido com o effort baseline, é comparado com **cada** combinação `candidato + effort` da matriz. Cada combinação recebe um status em relação ao baseline (`versusBaseline`, as mesmas regras da etapa 1) e a melhor combinação é escolhida por:
+
+1. mais casos corretos
+2. menos falhas de execução
+3. **menor effort** (em empate de qualidade, o effort menor vence)
+4. menor latência média
+
+Exemplos: `low 3/3` e `medium 3/3` → `low`. `low 2/3` e `medium 3/3` → `medium` pode avançar.
+
+Somente a melhor combinação, e apenas quando o status dela é `CANDIDATO-ETAPA-2`, é listada em `stage2.candidates` no relatório. A etapa 2 ainda não está implementada; o relatório apenas prepara essa lista.
+
+Tokens de saída são registrados quando o próprio Claude Code os informa (`outputTokens`); no Codex esse dado não fica disponível de forma confiável e fica `null`. Tokens e custo não entram na decisão.
+
+Nada é aplicado automaticamente: nem tiers, nem modelos, nem effort. O watcher continua apenas registrando modelos novos em `pending-models.json`; os efforts testados vêm de `efforts.json` no momento do benchmark.
+
+## Limitação do router
+
+O Jev Router (1.6.0) só substitui o campo `model` da requisição e pode remover campos (`omit`, por exemplo `output_config.effort` nos targets Haiku). Ele **não** define nem reescreve reasoning effort por tier, e uma chave `effort` em `config.json` seria ignorada silenciosamente, por isso ela não é usada.
+
+Na prática, o effort enviado é o que o cliente envia:
+
+- Codex: `model_reasoning_effort` no seu `%USERPROFILE%\.codex\config.toml` (ou `/model` na sessão)
+- Claude Code: `--effort` ou a configuração de effort do próprio Claude Code
+
+Esse mesmo effort vale para qualquer tier que o router escolher. O effort recomendado pelo benchmark é apenas uma sugestão: ele não é aplicado em lugar nenhum, e usá-lo exige uma alteração manual no cliente.
+
 ---
 
 # Cache
@@ -354,6 +480,14 @@ model-lab\benchmark-cache.json
 ```
 
 Assim o modelo atual não precisa ser reavaliado toda vez que surge um novo candidato.
+
+A chave inclui o effort:
+
+```text
+provider|tier|modelo|effort|caseId
+```
+
+`effort` é `none` quando nenhum effort é enviado. Resultados de `low`, `medium` e `high` nunca se misturam. Entradas antigas (`provider|tier|modelo|caseId`) são convertidas na leitura: OpenAI para `low` (o valor que o benchmark antigo sempre usava) e Anthropic para `none`.
 
 ---
 
@@ -370,6 +504,31 @@ Exemplo:
 ```text
 20261001-150000-openai-fast-modelo-novo.json
 ```
+
+Cada relatório contém:
+
+- `routerTierModel`: modelo atual do tier no router;
+- `efforts.baseline`: effort usado para medir o modelo atual e sua origem (`client-efforts.json`, `efforts.json` ou `legacy-default`);
+- `efforts.client`: effort do cliente no dia a dia e sua origem (`unknown` quando não declarado);
+- `efforts.baselineMatchesClient`: `true`/`false`, ou `null` se o effort do cliente é desconhecido;
+- `efforts.recommended`: modelo e effort da melhor combinação, sempre com `applied: false`;
+- `baseline`: resumo do modelo atual com o effort baseline;
+- `candidates`: um resumo por effort testado, com `passed`, `failures`, `averageMilliseconds` e `versusBaseline`;
+- `candidate` (a melhor combinação), `recommendation`, `stage2` e `results` (`baseline` e `candidate`).
+
+Cada resultado registra provider, tier, modelo, effort, caso, acerto, latência e erro.
+
+---
+
+# Testes
+
+Testes do model-lab (reasoning effort, allowlists, cache, argumentos das CLIs, `-DryRun`, relatórios). Não fazem nenhuma chamada real de modelo: usam uma cópia temporária do `model-lab` e CLIs falsos (`.cmd`) que só registram os argumentos recebidos.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\model-lab-effort.tests.ps1
+```
+
+O script mostra o total de casos e falhas de cada parte (unidades e integração) e termina com código `1` se algum teste falhar. Os arquivos temporários ficam em `%TEMP%\jev-effort-test-<guid>` e são removidos ao final. Não precisa de `runtime\runtime-paths.json`, credenciais nem rede.
 
 ---
 
@@ -463,7 +622,10 @@ jev-router/
 │   ├── benchmark.ps1
 │   ├── cases.json
 │   ├── claude-direct-settings.json
+│   ├── client-efforts.example.json
+│   ├── client-efforts.json   (local, não versionado)
 │   ├── docker-watcher.mjs
+│   ├── efforts.json
 │   ├── watch.ps1
 │   └── reports/
 │
@@ -474,6 +636,9 @@ jev-router/
 │   ├── install.ps1
 │   ├── status.ps1
 │   └── uninstall.ps1
+│
+├── tests/
+│   └── model-lab-effort.tests.ps1
 │
 ├── Dockerfile
 ├── compose.yaml

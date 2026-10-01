@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "_comment": "Copie para client-efforts.json (ignorado pelo Git) e declare o effort que cada cliente usa no dia a dia. null = desconhecido. O benchmark nao le nem altera as configuracoes globais do Codex/Claude.",
+  "providers": {
+    "openai": {
+      "effort": null
+    },
+    "anthropic": {
+      "effort": null
+    }
+  }
+}
