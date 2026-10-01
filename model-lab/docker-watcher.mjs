@@ -10,6 +10,22 @@ const LOG_FILE = path.join(LAB, "docker-watcher.log");
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+// Respostas remotas maiores que isso são descartadas.
+const MAX_RESPONSE_BYTES = 1024 * 1024;
+
+// Nomes de modelos vêm de fontes remotas e acabam como argumentos
+// de linha de comando no benchmark (onde o Codex pode ser um .cmd).
+// Mantenha esta regra igual à de benchmark.ps1 e watch.ps1.
+const MODEL_NAME_MAX_LENGTH = 128;
+const MODEL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+const PROVIDER_MODEL_PREFIXES = {
+  openai: "gpt-",
+  anthropic: "claude-",
+};
+
+const TIERS = ["fast", "balanced", "frontier"];
+
 const SOURCES = [
   "https://raw.githubusercontent.com/dirien/jev-router/main/config/anthropic-only.json",
   "https://raw.githubusercontent.com/dirien/jev-router/main/config/anthropic-fable.json",
@@ -59,28 +75,47 @@ function writeJson(file, value) {
   );
 }
 
-function addCandidate(list, provider, tier, model) {
-  if (!["fast", "balanced", "frontier"].includes(tier)) {
-    return;
+function isValidModelName(provider, model) {
+  if (!Object.hasOwn(PROVIDER_MODEL_PREFIXES, provider)) {
+    return false;
   }
 
-  if (!model || typeof model !== "string") {
-    return;
+  if (typeof model !== "string") {
+    return false;
+  }
+
+  if (
+    model.length === 0 ||
+    model.length > MODEL_NAME_MAX_LENGTH
+  ) {
+    return false;
+  }
+
+  if (!MODEL_NAME_PATTERN.test(model)) {
+    return false;
   }
 
   // Neste ambiente queremos somente modelos oficiais
   // das famílias OpenAI e Anthropic.
-  if (
-    provider === "openai" &&
-    !model.startsWith("gpt-")
-  ) {
+  return model.startsWith(
+    PROVIDER_MODEL_PREFIXES[provider]
+  );
+}
+
+function addCandidate(list, provider, tier, model) {
+  if (!TIERS.includes(tier)) {
     return;
   }
 
-  if (
-    provider === "anthropic" &&
-    !model.startsWith("claude-")
-  ) {
+  if (model === undefined || model === null) {
+    return;
+  }
+
+  if (!isValidModelName(provider, model)) {
+    // Não ecoa o valor recebido: ele não é confiável.
+    log(
+      `Modelo remoto rejeitado (provider=${provider}, tier=${tier}): nome fora do formato permitido.`
+    );
     return;
   }
 
@@ -119,7 +154,21 @@ async function fetchJson(url) {
       );
     }
 
-    return await response.json();
+    const declaredLength = Number(
+      response.headers.get("content-length")
+    );
+
+    if (declaredLength > MAX_RESPONSE_BYTES) {
+      throw new Error("resposta remota grande demais");
+    }
+
+    const text = await response.text();
+
+    if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) {
+      throw new Error("resposta remota grande demais");
+    }
+
+    return JSON.parse(text);
   } finally {
     clearTimeout(timeout);
   }
@@ -281,11 +330,21 @@ async function checkOnce() {
       continue;
     }
 
-    const currentModel = getCurrentModel(
+    let currentModel = getCurrentModel(
       current,
       item.provider,
       item.tier
     );
+
+    if (
+      currentModel !== null &&
+      !isValidModelName(item.provider, currentModel)
+    ) {
+      log(
+        `Modelo atual em config.json rejeitado (provider=${item.provider}, tier=${item.tier}): nome fora do formato permitido.`
+      );
+      currentModel = null;
+    }
 
     const candidate = {
       detectedAt: timestamp(),

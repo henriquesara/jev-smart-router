@@ -184,6 +184,12 @@ function Write-CliWrapper(
     [string]$Destination
 ) {
 
+    # O caminho vai literalmente para dentro de um .cmd: % e aspas
+    # seriam reinterpretados pelo cmd.exe.
+    if ($RealPath -match '["%\x00-\x1F\x7F]') {
+        throw "Caminho do $CliName contem caracteres nao suportados no wrapper (aspas, % ou caracteres de controle)."
+    }
+
     $extension = [System.IO.Path]::GetExtension(
         $RealPath
     ).ToLowerInvariant()
@@ -211,6 +217,45 @@ endlocal & exit /b %JEV_EXIT_CODE%
         -Path $Destination `
         -Value $content `
         -Encoding ASCII
+}
+
+# Restringe o arquivo de segredos ao usuario atual, SYSTEM e
+# Administradores. Usa SIDs para funcionar em Windows de qualquer idioma.
+# Nunca le nem exibe o conteudo do arquivo.
+function Protect-SecretFile([string]$Path) {
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+
+    try {
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+        $adminsSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+
+        # Desativa heranca e descarta as regras herdadas.
+        $acl.SetAccessRuleProtection($true, $false)
+
+        foreach ($sid in @($currentUser, $systemSid, $adminsSid)) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+
+            $acl.AddAccessRule($rule)
+        }
+
+        # Uma FileSecurity nova so contem DACL: owner/SACL nao sao alterados.
+        Set-Acl -LiteralPath $Path -AclObject $acl
+
+        Write-Host "Permissoes de $([System.IO.Path]::GetFileName($Path)) restritas ao usuario atual, SYSTEM e Administradores."
+    }
+    catch {
+        Write-Warning "Nao foi possivel restringir as permissoes de $([System.IO.Path]::GetFileName($Path)). Verifique manualmente com icacls."
+    }
 }
 
 function Invoke-DockerCommand([string[]]$DockerArgs) {
@@ -261,6 +306,10 @@ try {
     docker version | Out-Null
 }
 catch {
+    throw "Docker foi encontrado, mas nao esta disponivel."
+}
+
+if ($LASTEXITCODE -ne 0) {
     throw "Docker foi encontrado, mas nao esta disponivel."
 }
 
@@ -352,6 +401,8 @@ if ([string]::IsNullOrWhiteSpace($typesafeKey)) {
 
     Write-Host "TYPESAFE_API_KEY salva em config/env."
 }
+
+Protect-SecretFile $EnvFile
 
 Write-Host ""
 

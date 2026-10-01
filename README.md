@@ -283,6 +283,14 @@ model-lab\pending-models.json
 
 Esses arquivos são locais e não são versionados.
 
+Um modelo descoberto remotamente **não é confiável automaticamente**. O watcher (e também `watch.ps1` e `benchmark.ps1`, de forma independente) só aceita nomes que:
+
+- sejam texto com no máximo 128 caracteres
+- comecem com letra ou número e usem apenas `A-Z a-z 0-9 . _ : -`
+- comecem com `gpt-` (OpenAI) ou `claude-` (Anthropic)
+
+Providers desconhecidos e nomes fora desse formato são descartados e registrados no log sem ecoar o valor recebido.
+
 ---
 
 # Benchmark
@@ -331,7 +339,9 @@ CANDIDATO-ETAPA-2
 INCONCLUSIVO
 ```
 
-Nenhum resultado altera automaticamente o `config.json`.
+Nenhum resultado altera automaticamente o `config.json`: nenhum candidato muda os tiers sozinho. A promoção de um modelo é sempre uma edição manual.
+
+O benchmark só executa chamadas de modelo quando existe alguma pendência em `pending-models.json`; sem pendências, nenhuma chamada é feita.
 
 ---
 
@@ -398,6 +408,8 @@ Nunca versione:
 ```text
 config\env
 config\config.json
+bin\codex.cmd
+bin\claude.cmd
 runtime\
 model-lab\seen-models.json
 model-lab\pending-models.json
@@ -405,7 +417,22 @@ model-lab\benchmark-cache.json
 model-lab\reports\
 ```
 
-O `.gitignore` fornecido pelo projeto já cobre esses arquivos.
+O `.gitignore` fornecido pelo projeto cobre esses arquivos e o `.dockerignore` os mantém fora do contexto de build do Docker.
+
+Os wrappers `bin\codex.cmd` e `bin\claude.cmd` são gerados localmente pelo `install.ps1`, pois contêm caminhos específicos da máquina. Eles não são versionados.
+
+O `install.ps1` restringe as permissões de `config\env` ao usuário atual, SYSTEM e Administradores (sem alterar o conteúdo). Se isso falhar, ele apenas emite um aviso.
+
+Isolamento dos containers:
+
+- o router recebe somente `config\config.json` e `config\env`, ambos em modo somente leitura, além do volume de estado
+- o watcher recebe somente `config\config.json` (somente leitura) e a pasta `model-lab\`; ele **não** tem acesso a `config\env` nem a outras credenciais
+- o watcher roda com sistema de arquivos somente leitura (exceto `model-lab\`), sem capabilities e com `no-new-privileges`
+- as portas ficam publicadas apenas em `127.0.0.1`
+
+Como `config\config.json` e `config\env` são montados como arquivos individuais, ambos precisam existir antes do `docker compose up` (o `install.ps1` os cria).
+
+Essas medidas reduzem a exposição, mas não eliminam todos os riscos; por exemplo, qualquer processo executado com o seu usuário do Windows ainda consegue ler `config\env`.
 
 O projeto não precisa armazenar:
 
@@ -424,8 +451,8 @@ Os logins continuam sendo administrados pelos CLIs oficiais.
 jev-router/
 │
 ├── bin/
-│   ├── codex.cmd
-│   ├── claude.cmd
+│   ├── codex.cmd        (gerado pelo install.ps1, não versionado)
+│   ├── claude.cmd       (gerado pelo install.ps1, não versionado)
 │   └── preflight.ps1
 │
 ├── config/
@@ -450,6 +477,7 @@ jev-router/
 │
 ├── Dockerfile
 ├── compose.yaml
+├── .dockerignore
 ├── .gitignore
 └── README.md
 ```

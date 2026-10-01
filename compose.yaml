@@ -8,18 +8,32 @@ services:
       - "127.0.0.1:4000:4000"
       - "127.0.0.1:4100:4100"
 
+    # Somente os dois arquivos que o router lê, em modo somente leitura.
+    # Backups e outros arquivos locais de config/ não entram no container.
     volumes:
-      - ./config:/config
+      - ./config/config.json:/config/config.json:ro
+      - ./config/env:/config/env:ro
       - jev-router-state:/state
 
+    security_opt:
+      - no-new-privileges:true
+
   model-watcher:
-    build: .
+    # O watcher só precisa de Node e de fetch nativo; não usa a imagem do router.
+    image: node:22-bookworm-slim
     container_name: jev-model-watcher
     restart: unless-stopped
 
+    # Sem acesso a config/env: o watcher nunca vê credenciais.
     volumes:
-      - ./config:/config:ro
+      - ./config/config.json:/config/config.json:ro
       - ./model-lab:/model-lab
+
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
     command:
       - node

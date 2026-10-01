@@ -1,12 +1,22 @@
 $ErrorActionPreference = "Stop"
 
-$Root = "C:\jev-router"
-$Lab = "$Root\model-lab"
+# Caminhos relativos a este script (model-lab\ dentro do projeto).
+$Lab = $PSScriptRoot
+$Root = Split-Path -Parent $Lab
 
-$RouterConfig = "$Root\config\config.json"
-$StateFile = "$Lab\seen-models.json"
-$PendingFile = "$Lab\pending-models.json"
-$LogFile = "$Lab\watch.log"
+$RouterConfig = Join-Path $Root "config\config.json"
+$StateFile = Join-Path $Lab "seen-models.json"
+$PendingFile = Join-Path $Lab "pending-models.json"
+$LogFile = Join-Path $Lab "watch.log"
+
+# Mantenha esta regra igual a docker-watcher.mjs e benchmark.ps1.
+$ModelNameMaxLength = 128
+$ModelNamePattern = '^[A-Za-z0-9][A-Za-z0-9._:-]*\z'
+
+$ProviderModelPrefixes = @{
+    "openai" = "gpt-"
+    "anthropic" = "claude-"
+}
 
 $Sources = @(
     "https://raw.githubusercontent.com/dirien/jev-router/main/config/anthropic-only.json",
@@ -20,23 +30,49 @@ function Log($Text) {
     Write-Host $line
 }
 
-function Add-Candidate($List, $Provider, $Tier, $Model) {
+function Test-ModelName($Provider, $Model) {
 
-    # Só avaliamos os tiers principais.
-    if ($Tier -notin @("fast", "balanced", "frontier")) {
-        return
+    if (
+        $Provider -isnot [string] -or
+        -not $ProviderModelPrefixes.ContainsKey($Provider) -or
+        $Provider -cne $Provider.ToLowerInvariant()
+    ) {
+        return $false
     }
 
-    if ([string]::IsNullOrWhiteSpace($Model)) {
-        return
+    if ($Model -isnot [string]) {
+        return $false
+    }
+
+    if ($Model.Length -lt 1 -or $Model.Length -gt $ModelNameMaxLength) {
+        return $false
+    }
+
+    if ($Model -cnotmatch $ModelNamePattern) {
+        return $false
     }
 
     # Neste PC só queremos modelos oficiais dessas duas famílias.
-    if ($Provider -eq "openai" -and $Model -notmatch "^gpt-") {
+    return $Model.StartsWith(
+        $ProviderModelPrefixes[$Provider],
+        [System.StringComparison]::Ordinal
+    )
+}
+
+function Add-Candidate($List, $Provider, $Tier, $Model) {
+
+    # Só avaliamos os tiers principais.
+    if ($Tier -isnot [string] -or $Tier -cnotin @("fast", "balanced", "frontier")) {
         return
     }
 
-    if ($Provider -eq "anthropic" -and $Model -notmatch "^claude-") {
+    if ($null -eq $Model) {
+        return
+    }
+
+    if (-not (Test-ModelName $Provider $Model)) {
+        # Não ecoa o valor recebido: ele não é confiável.
+        Log "Modelo remoto rejeitado (provider=$Provider, tier=$Tier): nome fora do formato permitido."
         return
     }
 
@@ -150,6 +186,11 @@ foreach ($key in $discovered.Keys) {
             $currentModel = $null
         }
 
+        if ($null -ne $currentModel -and -not (Test-ModelName $item.provider $currentModel)) {
+            Log "Modelo atual em config.json rejeitado ($($item.provider)/$($item.tier)): nome fora do formato permitido."
+            $currentModel = $null
+        }
+
         $newModels += [ordered]@{
             detectedAt = (Get-Date).ToString("o")
             provider = $item.provider
@@ -169,8 +210,30 @@ foreach ($key in $discovered.Keys) {
 
 if ($newModels.Count -gt 0) {
 
-    @($newModels) |
-        ConvertTo-Json -Depth 8 |
+    # Preserva pendencias ainda nao avaliadas (mesmo comportamento
+    # do docker-watcher.mjs) em vez de sobrescreve-las.
+    $existingPending = @()
+
+    if (Test-Path $PendingFile) {
+        try {
+            $parsedPending = Get-Content $PendingFile -Raw | ConvertFrom-Json
+
+            if ($null -ne $parsedPending) {
+                $existingPending = @($parsedPending) | Where-Object { $null -ne $_ }
+            }
+        }
+        catch {
+            Log "AVISO: pending-models.json invalido; sera substituido."
+        }
+    }
+
+    $merged = [ordered]@{}
+
+    foreach ($entry in @($existingPending) + @($newModels)) {
+        $merged["$($entry.provider)|$($entry.tier)|$($entry.candidate)"] = $entry
+    }
+
+    ConvertTo-Json -InputObject @($merged.Values) -Depth 8 |
         Set-Content $PendingFile -Encoding UTF8
 
     foreach ($key in $discovered.Keys) {

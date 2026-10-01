@@ -1,16 +1,17 @@
 $ErrorActionPreference = "Stop"
 
-$Root = "C:\jev-router"
-$Lab = "$Root\model-lab"
+# Caminhos relativos a este script (model-lab\ dentro do projeto).
+$Lab = $PSScriptRoot
+$Root = Split-Path -Parent $Lab
 
-$CasesFile = "$Lab\cases.json"
-$PendingFile = "$Lab\pending-models.json"
-$CacheFile = "$Lab\benchmark-cache.json"
-$ReportsDir = "$Lab\reports"
-$ClaudeSettings = "$Lab\claude-direct-settings.json"
-$LogFile = "$Lab\benchmark.log"
+$CasesFile = Join-Path $Lab "cases.json"
+$PendingFile = Join-Path $Lab "pending-models.json"
+$CacheFile = Join-Path $Lab "benchmark-cache.json"
+$ReportsDir = Join-Path $Lab "reports"
+$ClaudeSettings = Join-Path $Lab "claude-direct-settings.json"
+$LogFile = Join-Path $Lab "benchmark.log"
 
-$RuntimeFile = "$Root\runtime\runtime-paths.json"
+$RuntimeFile = Join-Path $Root "runtime\runtime-paths.json"
 
 if (-not (Test-Path $RuntimeFile)) {
     throw "Runtime nao encontrado: $RuntimeFile. Execute scripts\install.ps1 primeiro."
@@ -47,6 +48,77 @@ function Log($Text) {
     Write-Host $line
 }
 
+# ------------------------------------------------------------
+# Validacao de nomes de modelos
+# ------------------------------------------------------------
+# pending-models.json e escrito pelo watcher a partir de fontes
+# remotas. Nao confiamos nele: o nome vira argumento de linha de
+# comando do Codex/Claude. Mantenha igual a docker-watcher.mjs.
+# ------------------------------------------------------------
+
+$ModelNameMaxLength = 128
+$ModelNamePattern = '^[A-Za-z0-9][A-Za-z0-9._:-]*\z'
+
+$ProviderModelPrefixes = @{
+    "openai" = "gpt-"
+    "anthropic" = "claude-"
+}
+
+function Test-Provider($Provider) {
+
+    return (
+        $Provider -is [string] -and
+        $ProviderModelPrefixes.ContainsKey($Provider) -and
+        $Provider -ceq $Provider.ToLowerInvariant()
+    )
+}
+
+function Test-ModelName($Provider, $Model) {
+
+    if (-not (Test-Provider $Provider)) {
+        return $false
+    }
+
+    if ($Model -isnot [string]) {
+        return $false
+    }
+
+    if ($Model.Length -lt 1 -or $Model.Length -gt $ModelNameMaxLength) {
+        return $false
+    }
+
+    if ($Model -cnotmatch $ModelNamePattern) {
+        return $false
+    }
+
+    return $Model.StartsWith(
+        $ProviderModelPrefixes[$Provider],
+        [System.StringComparison]::Ordinal
+    )
+}
+
+# O Codex instalado via npm e um .cmd, e o PowerShell 5.1 repassa
+# os argumentos ao cmd.exe, que reinterpreta metacaracteres.
+# Bloqueamos qualquer argumento dinamico que o cmd possa interpretar.
+function Assert-SafeCliArgument($Executable, $Value) {
+
+    if ($Executable -notmatch '\.(cmd|bat)\z') {
+        return
+    }
+
+    $text = [string]$Value
+
+    if ($text -match '["%!\x00-\x1F\x7F]') {
+        throw "Argumento recusado: contem caracteres inseguros para cmd.exe."
+    }
+
+    # Sem espacos o PowerShell nao coloca aspas, entao & | < > ^ ( )
+    # seriam interpretados pelo cmd.exe.
+    if ($text -notmatch '\s' -and $text -match '[&|<>^()]') {
+        throw "Argumento recusado: contem caracteres inseguros para cmd.exe."
+    }
+}
+
 function Normalize-Answer($Text) {
 
     if ($null -eq $Text) {
@@ -70,7 +142,11 @@ function Run-OpenAIModel($Model, $Prompt) {
 
     try {
 
-        $args = @(
+        Assert-SafeCliArgument $RealCodex $Model
+        Assert-SafeCliArgument $RealCodex $messageFile
+        Assert-SafeCliArgument $RealCodex $Prompt
+
+        $cliArgs = @(
             "exec",
             "--ephemeral",
             "--skip-git-repo-check",
@@ -81,7 +157,7 @@ function Run-OpenAIModel($Model, $Prompt) {
             $Prompt
         )
 
-        & $RealCodex @args 2>$errorFile | Out-Null
+        & $RealCodex @cliArgs 2>$errorFile | Out-Null
 
         $exitCode = $LASTEXITCODE
 
@@ -136,7 +212,11 @@ function Run-AnthropicModel($Model, $Prompt) {
 
     try {
 
-        $args = @(
+        Assert-SafeCliArgument $RealClaude $Model
+        Assert-SafeCliArgument $RealClaude $ClaudeSettings
+        Assert-SafeCliArgument $RealClaude $Prompt
+
+        $cliArgs = @(
             "-p",
             "--model", $Model,
             "--settings", $ClaudeSettings,
@@ -145,7 +225,7 @@ function Run-AnthropicModel($Model, $Prompt) {
             $Prompt
         )
 
-        $raw = & $RealClaude @args 2>$errorFile
+        $raw = & $RealClaude @cliArgs 2>$errorFile
 
         $exitCode = $LASTEXITCODE
 
@@ -200,6 +280,11 @@ function Run-AnthropicModel($Model, $Prompt) {
 
 function Run-Model($Provider, $Model, $Prompt) {
 
+    # Segunda barreira: nunca chama uma CLI com nome nao validado.
+    if (-not (Test-ModelName $Provider $Model)) {
+        throw "Modelo recusado: nome fora do formato permitido."
+    }
+
     if ($Provider -eq "openai") {
         return Run-OpenAIModel $Model $Prompt
     }
@@ -208,7 +293,7 @@ function Run-Model($Provider, $Model, $Prompt) {
         return Run-AnthropicModel $Model $Prompt
     }
 
-    throw "Provider não suportado: $Provider"
+    throw "Provider nao suportado."
 }
 
 function Cache-Key($Provider, $Tier, $Model, $CaseId) {
@@ -395,9 +480,22 @@ foreach ($candidateInfo in $pending) {
         continue
     }
 
-    if ($tier -notin @("fast", "balanced", "frontier")) {
+    # Valores nao confiaveis: nunca sao ecoados no log quando invalidos.
+    if (-not (Test-Provider $provider)) {
 
-        Log "Ignorado tier nao benchmarkavel: $tier"
+        Log "Ignorado registro pendente com provider nao suportado."
+        continue
+    }
+
+    if ($tier -isnot [string] -or $tier -cnotin @("fast", "balanced", "frontier")) {
+
+        Log "Ignorado registro pendente com tier nao benchmarkavel ($provider)."
+        continue
+    }
+
+    if (-not (Test-ModelName $provider $candidate)) {
+
+        Log "Ignorado candidato rejeitado ($provider/$tier): nome fora do formato permitido."
         continue
     }
 
@@ -408,7 +506,14 @@ foreach ($candidateInfo in $pending) {
         continue
     }
 
-    if ($candidate -eq $current) {
+    if (-not (Test-ModelName $provider $current)) {
+
+        Log "Ignorado: modelo atual ($provider/$tier) fora do formato permitido."
+        $remaining += $candidateInfo
+        continue
+    }
+
+    if ($candidate -ceq $current) {
 
         Log "Candidato ja e o modelo atual: $candidate"
         continue

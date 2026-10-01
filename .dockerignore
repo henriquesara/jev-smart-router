@@ -1,0 +1,37 @@
+# O Dockerfile não copia arquivos do projeto, mas o contexto de build
+# inteiro é enviado ao daemon. Mantenha segredos e estado local fora dele.
+
+.git
+.gitignore
+.dockerignore
+
+# Segredos / configuração local
+config/env
+config/env.*
+config/config.json
+config/*.backup.json
+docker-temp-config/
+
+# Wrappers e runtime gerados pelo instalador
+bin/*.cmd
+runtime/*
+!runtime/.gitkeep
+
+# Estado, cache, logs e relatórios do model-lab
+model-lab/seen-models.json
+model-lab/pending-models.json
+model-lab/benchmark-cache.json
+model-lab/*.log
+model-lab/reports/*
+!model-lab/reports/.gitkeep
+
+# Logs, temporários e backups
+*.log
+*.tmp
+*.bak
+*.backup
+*.backup.*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

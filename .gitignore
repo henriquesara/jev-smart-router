@@ -1,9 +1,21 @@
-﻿# ------------------------------------------------------------
+# ------------------------------------------------------------
 # Segredos / configuração local
 # ------------------------------------------------------------
 
 config/env
+config/env.*
+!config/env.example
 config/config.json
+config/config.backup.json
+config/*.backup.json
+
+# ------------------------------------------------------------
+# Wrappers gerados localmente pelo instalador
+# (contêm caminhos específicos da máquina)
+# ------------------------------------------------------------
+
+bin/codex.cmd
+bin/claude.cmd
 
 # ------------------------------------------------------------
 # Runtime gerado pelo instalador
@@ -35,6 +47,12 @@ model-lab/reports/*
 !model-lab/reports/.gitkeep
 
 # ------------------------------------------------------------
+# Configuração local do Docker CLI
+# ------------------------------------------------------------
+
+docker-temp-config/
+
+# ------------------------------------------------------------
 # Temporários
 # ------------------------------------------------------------
 
@@ -51,14 +69,3 @@ Thumbs.db
 
 .vscode/
 .idea/
-
-@'
-
-# ------------------------------------------------------------
-# Backups / configs locais adicionais
-# ------------------------------------------------------------
-
-config/config.backup.json
-config/env.txt
-docker-temp-config/
-'@ | Add-Content C:\jev-router\.gitignore

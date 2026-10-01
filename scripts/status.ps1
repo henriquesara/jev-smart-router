@@ -5,6 +5,20 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $RuntimeFile = Join-Path $ProjectRoot "runtime\runtime-paths.json"
 $PendingFile = Join-Path $ProjectRoot "model-lab\pending-models.json"
 
+# pending-models.json vem de fontes remotas: remove qualquer
+# caractere fora do formato de nome de modelo antes de exibir
+# (evita sequencias de escape no terminal).
+function Format-SafeText($Value) {
+
+    $text = [string]$Value
+
+    if ($text.Length -gt 128) {
+        $text = $text.Substring(0, 128)
+    }
+
+    return ($text -replace '[^A-Za-z0-9._:-]', '?')
+}
+
 Write-Host ""
 Write-Host "======================================="
 Write-Host " Jev Smart Router - Status"
@@ -112,9 +126,9 @@ else {
                 foreach ($item in $items) {
                     Write-Host (
                         "    {0} / {1} / {2}" -f `
-                        $item.provider,
-                        $item.tier,
-                        $item.candidate
+                        (Format-SafeText $item.provider),
+                        (Format-SafeText $item.tier),
+                        (Format-SafeText $item.candidate)
                     )
                 }
             }
