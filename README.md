@@ -232,20 +232,44 @@ http://127.0.0.1:4100
 
 # Descoberta automática de modelos
 
-O container:
+O mecanismo principal de descoberta automática é o container:
 
 ```text
 jev-model-watcher
 ```
 
-executa uma verificação:
+Ele é iniciado junto com o Jev Router pelo `docker compose` e executa uma verificação:
 
-- imediatamente ao iniciar;
-- novamente a cada 24 horas.
+- imediatamente ao subir
+- novamente a cada 24 horas
+- sem depender do Agendador de Tarefas do Windows
+- sem consumir tokens de Claude ou Codex durante a simples detecção
 
-O watcher compara modelos conhecidos com os modelos publicados nas configurações monitoradas.
+O watcher utilizado normalmente pelo projeto é:
 
-Estado local:
+```text
+model-lab\docker-watcher.mjs
+```
+
+Ele consulta as fontes configuradas, compara os modelos encontrados com o estado conhecido e registra novos candidatos em:
+
+```text
+model-lab\pending-models.json
+```
+
+O arquivo:
+
+```text
+model-lab\watch.ps1
+```
+
+também está incluído no repositório, mas funciona apenas como **ferramenta manual/fallback**.
+
+Ele pode ser usado para executar a mesma verificação diretamente no Windows em situações de diagnóstico ou quando o usuário não quiser utilizar o container `jev-model-watcher`.
+
+No funcionamento padrão do projeto, **não é necessário executar `watch.ps1` manualmente**.
+
+Estado dos modelos já conhecidos:
 
 ```text
 model-lab\seen-models.json
@@ -257,7 +281,7 @@ Novos candidatos:
 model-lab\pending-models.json
 ```
 
-Esses arquivos não são versionados.
+Esses arquivos são locais e não são versionados.
 
 ---
 
@@ -413,6 +437,7 @@ jev-router/
 │   ├── cases.json
 │   ├── claude-direct-settings.json
 │   ├── docker-watcher.mjs
+│   ├── watch.ps1
 │   └── reports/
 │
 ├── runtime/
@@ -441,9 +466,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 
 Isso:
 
-- remove `bin` do PATH;
-- para os containers;
-- preserva configurações e segredos locais.
+- remove `bin` do PATH
+- para os containers
+- preserva configurações e segredos locais
 
 Para também remover o runtime:
 
@@ -500,7 +525,28 @@ e:
 ...\jev-router\bin\claude.cmd
 ```
 
-Abra um novo terminal após a instalação.
+Se o PATH do terminal ainda estiver desatualizado, recarregue-o:
+
+```powershell
+$machinePath = [Environment]::GetEnvironmentVariable(
+    "Path",
+    "Machine"
+)
+
+$userPath = [Environment]::GetEnvironmentVariable(
+    "Path",
+    "User"
+)
+
+$env:Path = "$userPath;$machinePath"
+```
+
+Depois confira novamente:
+
+```powershell
+Get-Command codex -All
+Get-Command claude -All
+```
 
 ## Router não responde
 
