@@ -1,0 +1,70 @@
+{
+  "fast": [
+    {
+      "id": "fast-01",
+      "prompt": "Responda somente com o resultado, sem explicação. JavaScript: let x = 3; x *= 4; x -= 2; console.log(x). Qual é a saída?",
+      "expected": "^10$"
+    },
+    {
+      "id": "fast-02",
+      "prompt": "Corrija somente o nome da função e responda apenas com a linha corrigida: functon soma(a,b) { return a+b; }",
+      "expected": "^function soma\\(a,b\\) \\{ return a\\+b; \\}$"
+    },
+    {
+      "id": "fast-03",
+      "prompt": "Responda somente TRUE ou FALSE. Em Python, len([1,2,3,4]) == 4.",
+      "expected": "^TRUE$"
+    },
+    {
+      "id": "fast-04",
+      "prompt": "Responda somente com a complexidade Big-O. Um acesso por índice em um array comum.",
+      "expected": "^O\\(1\\)$"
+    }
+  ],
+
+  "balanced": [
+    {
+      "id": "balanced-01",
+      "prompt": "Responda apenas com o valor final. Python: total=0; for i in range(1,6): total += i*i. Qual é total?",
+      "expected": "^55$"
+    },
+    {
+      "id": "balanced-02",
+      "prompt": "Há um bug: def clamp(x, lo, hi): return min(lo, max(hi, x)). Responda somente com a expressão correta depois de return.",
+      "expected": "^min\\(hi, max\\(lo, x\\)\\)$"
+    },
+    {
+      "id": "balanced-03",
+      "prompt": "Responda somente O(n), O(log n), O(n log n) ou O(n²). Complexidade média do mergesort?",
+      "expected": "^O\\(n log n\\)$"
+    },
+    {
+      "id": "balanced-04",
+      "prompt": "SQL: precisamos manter todas as linhas da tabela users mesmo sem pedidos correspondentes em orders. Responda somente INNER JOIN, LEFT JOIN, RIGHT JOIN ou CROSS JOIN.",
+      "expected": "^LEFT JOIN$"
+    }
+  ],
+
+  "frontier": [
+    {
+      "id": "frontier-01",
+      "prompt": "Responda somente com o número. Um grafo completo não-direcionado com 12 vértices possui quantas arestas?",
+      "expected": "^66$"
+    },
+    {
+      "id": "frontier-02",
+      "prompt": "Responda somente com a complexidade. Para T(n)=2T(n/2)+n, qual a complexidade assintótica?",
+      "expected": "^O\\(n log n\\)$"
+    },
+    {
+      "id": "frontier-03",
+      "prompt": "Duas transações fazem read-modify-write concorrente sobre o mesmo saldo sem lock. Responda somente com o nome clássico da anomalia: lost update, dirty read, phantom read ou write skew.",
+      "expected": "^lost update$"
+    },
+    {
+      "id": "frontier-04",
+      "prompt": "Responda somente YES ou NO. Se todos os pesos de um grafo são não-negativos, Dijkstra produz menores caminhos a partir de uma origem?",
+      "expected": "^YES$"
+    }
+  ]
+}

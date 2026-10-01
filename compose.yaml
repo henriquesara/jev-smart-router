@@ -1,0 +1,29 @@
+services:
+  jev-router:
+    build: .
+    container_name: jev-router
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:4000:4000"
+      - "127.0.0.1:4100:4100"
+
+    volumes:
+      - ./config:/config
+      - jev-router-state:/state
+
+  model-watcher:
+    build: .
+    container_name: jev-model-watcher
+    restart: unless-stopped
+
+    volumes:
+      - ./config:/config:ro
+      - ./model-lab:/model-lab
+
+    command:
+      - node
+      - /model-lab/docker-watcher.mjs
+
+volumes:
+  jev-router-state:
