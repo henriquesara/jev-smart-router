@@ -583,6 +583,20 @@ Para adotar no seu `config.json` local, aplique as mesmas quatro mudanças e rei
 
 Validação real (Claude Code 2.1.286, router de teste isolado, um pedido por tier fixado com `x-jev-tier`): `fast` foi para `claude-haiku-4-5` sem effort; `balanced` para `claude-sonnet-5` com `medium`; `frontier` para `claude-opus-5-5` com `high`; `deep` para `claude-opus-5-5` com `xhigh`. Todos terminaram em `200`. Em `balanced`, os dois primeiros pedidos voltaram `400`, e isso acontece também **sem** effort no target. O Claude Code (que acredita falar com `opus`) envia recursos que `claude-sonnet-5` recusa (`output_config.effort requires a model that supports per-turn effort`, `tool_addition/tool_removal is not supported on this model`), e o próprio cliente repete o pedido sem eles.
 
+### Compatibilidade Anthropic por modelo alvo
+
+O Claude Code monta cada pedido para o modelo que ele acredita usar, mas o router pode enviá-lo a outro modelo. Antes do upstream, `compat.mjs` (`normalizeForTarget`) recebe o target final e remove apenas os recursos que **comprovadamente** são recusados por aquele modelo. A comprovação vem de comparar o pedido que falhou com a repetição do próprio cliente que funcionou. A função não altera a entrada e é determinística.
+
+| Modelo alvo | Condição | Removido | Preservado |
+| --- | --- | --- | --- |
+| `claude-sonnet-*` | `anthropic-beta` contém exatamente `per-turn-control-2026-07-01` | esse beta; `output_config` dentro de cada item de `messages[]` | `output_config` de nível superior (effort), `thinking`, `context_management`, `tools`, demais betas (em ordem) e demais campos das mensagens |
+
+- Opus, Haiku e OpenAI não passam por nenhuma regra. No Haiku, o dobramento das mensagens `system`, que já existia no router, continua igual.
+- `mid-conversation-tool-changes-2026-07-01` **não** é removido. O `400 tool_addition/tool_removal` só apareceu numa execução, sem captura da forma do pedido, e não se reproduziu depois. Por isso ainda não há evidência para uma regra.
+- O log `done` traz apenas flags e contagens, por exemplo `compat: { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: false }`. Não registra betas, texto nem headers.
+
+Validação real (Claude Code 2.1.286): `routine → balanced → claude-sonnet-5` com effort `medium` recebeu `200` no **primeiro** pedido ao upstream.
+
 ### Recomendação do benchmark
 
 `efforts.recommended` no relatório traz a combinação sugerida pronta para o router, por exemplo:
@@ -777,6 +791,7 @@ jev-router/
 │   └── jev-router-1.6.0/
 │       ├── apply.mjs    (aplicado no build; falha se versão/hash divergirem)
 │       ├── effort.mjs   (effort por target)
+│       ├── compat.mjs   (compatibilidade Anthropic por modelo alvo)
 │       ├── models.mjs   (GET /v1/models para o Codex)
 │       ├── ui-effort.js (Live View: effort por requisição)
 │       └── ui-route.js  (Live View: arestas do grafo e da rota em foco)

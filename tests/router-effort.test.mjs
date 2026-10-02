@@ -1,7 +1,7 @@
-// Effort per tier, GET /v1/models, the deep tier and the live view's route highlight in the patched
-// jev-router (patches/jev-router-1.6.0).
+// Effort per tier, Anthropic compatibility per target model, GET /v1/models, the deep tier and the
+// live view's route highlight in the patched jev-router (patches/jev-router-1.6.0).
 //
-// Unit tests of effort.mjs, models.mjs, ui-effort.js, ui-route.js and of the patch script run anywhere:
+// Unit tests of effort.mjs, compat.mjs, models.mjs, ui-effort.js, ui-route.js and of the patch script run anywhere:
 //   node --test tests/router-effort.test.mjs
 // The router tests need the patched package and run in the image (no network, no real upstream):
 //   docker run --rm --network none -v "${PWD}/tests:/repo/tests:ro" -v "${PWD}/patches:/repo/patches:ro" \
@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { normalizeForTarget, PER_TURN_BETA } from '../patches/jev-router-1.6.0/compat.mjs';
 import { applyEffort, EFFORTS, effortFor, effortProblems, isEffort, supportsEffort } from '../patches/jev-router-1.6.0/effort.mjs';
 import { CATALOG_HEADERS, MAX_CATALOG_BYTES, catalogBody, catalogPath, catalogTarget } from '../patches/jev-router-1.6.0/models.mjs';
 import {
@@ -115,6 +116,132 @@ describe('effort.mjs', () => {
     assert.match(effortProblems('anthropic', { model: 'claude-haiku-4-5', effort: 'low' }, 'x')[0], /model takes no effort/);
     assert.match(effortProblems('anthropic', { model: 'claude-sonnet-5', effort: 'low', omit: ['output_config.effort'] }, 'x')[0], /omit drops/);
     assert.match(effortProblems('gemini', { model: 'g', effort: 'low' }, 'x')[0], /not supported on the gemini surface/);
+  });
+});
+
+describe('compat.mjs: normalizeForTarget (Sonnet and per-turn control)', () => {
+  const others = 'claude-code-20250219,effort-2025-11-24';
+  const beta = (/** @type {string} */ value) => ({ 'content-type': 'application/json', 'anthropic-beta': value });
+  const sonnet = { model: 'claude-sonnet-5' };
+  /** The shape Claude Code sends with per-turn control: a mid-conversation system message with its own output_config. Test data. */
+  const perTurnBody = () => ({
+    model: 'claude-sonnet-5',
+    max_tokens: 1024,
+    thinking: { type: 'adaptive', display: 'omitted' },
+    context_management: { edits: [{ type: 'clear_thinking_20251015' }] },
+    output_config: { effort: 'medium' },
+    tools: [{ name: 'test_tool', input_schema: { type: 'object' } }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] },
+      { role: 'system', content: 'test-only system text', output_config: { effort: 'medium' } },
+      { role: 'user', content: 'again' },
+    ],
+  });
+
+  test('Sonnet with the beta: the beta and the message output_config go, everything else stays', () => {
+    const headers = beta(`claude-code-20250219,${PER_TURN_BETA},effort-2025-11-24`);
+    const body = perTurnBody();
+    const before = structuredClone({ headers, body });
+    const out = normalizeForTarget('anthropic', sonnet, headers, body);
+    assert.deepEqual(out.headers, { 'content-type': 'application/json', 'anthropic-beta': others }, 'other betas keep their order');
+    assert.deepEqual(out.body.output_config, { effort: 'medium' }, 'top-level output_config kept');
+    assert.deepEqual(out.body.messages[1], { role: 'system', content: 'test-only system text' }, 'other message fields kept');
+    assert.ok(!out.body.messages.some((m) => 'output_config' in m));
+    const { messages: outMessages, ...outRest } = out.body;
+    const { messages: inMessages, ...inRest } = before.body;
+    assert.deepEqual(outRest, inRest, 'thinking, context_management, tools and the rest unchanged');
+    assert.equal(outMessages.length, inMessages.length);
+    assert.equal(outMessages[0], body.messages[0], 'untouched messages are the same objects');
+    assert.equal(outMessages[2], body.messages[2]);
+    assert.deepEqual(out.compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: false });
+    assert.deepEqual({ headers, body }, before, 'inputs not mutated');
+  });
+
+  test('Sonnet with the beta and no message output_config: the beta goes, the body is the same object', () => {
+    const body = { model: 'claude-sonnet-5', output_config: { effort: 'medium' }, messages: [{ role: 'user', content: 'hi' }] };
+    const out = normalizeForTarget('anthropic', sonnet, beta(`${PER_TURN_BETA},${others}`), body);
+    assert.equal(out.body, body);
+    assert.equal(out.headers['anthropic-beta'], others);
+    assert.deepEqual(out.compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 0, midConversationToolChangesRemoved: false });
+  });
+
+  test('a header with only that beta is removed', () => {
+    const out = normalizeForTarget('anthropic', sonnet, beta(PER_TURN_BETA), perTurnBody());
+    assert.deepEqual(out.headers, { 'content-type': 'application/json' });
+    const spaced = normalizeForTarget('anthropic', { model: 'claude-sonnet-4-6' }, beta(` ${PER_TURN_BETA} , `), perTurnBody());
+    assert.ok(!('anthropic-beta' in spaced.headers));
+  });
+
+  test('Sonnet without that beta, or without the header: messages and headers unchanged, the same objects', () => {
+    for (const headers of [beta(others), beta(' claude-code-20250219 ,  effort-2025-11-24 '), { 'content-type': 'application/json' }]) {
+      const body = perTurnBody();
+      const out = normalizeForTarget('anthropic', sonnet, headers, body);
+      assert.equal(out.headers, headers);
+      assert.equal(out.body, body);
+      assert.equal(out.compat, undefined);
+      assert.deepEqual(body.messages[1].output_config, { effort: 'medium' });
+    }
+  });
+
+  test('Opus, Haiku, OpenAI and anything not a Sonnet model: nothing removed', () => {
+    const headers = beta(`${PER_TURN_BETA},${others}`);
+    for (const [surface, model] of [
+      ['anthropic', 'claude-opus-5-5'],
+      ['anthropic', 'claude-haiku-4-5'],
+      ['openai', 'claude-sonnet-5'],
+      ['openai', 'gpt-6.1-sol'],
+      ['gemini', 'claude-sonnet-5'],
+      ['anthropic', 'Claude-Sonnet-5'],
+      ['anthropic', 'x-claude-sonnet-5'],
+      ['anthropic', undefined],
+    ]) {
+      const body = perTurnBody();
+      const out = normalizeForTarget(/** @type {string} */ (surface), { model }, headers, body);
+      assert.equal(out.headers, headers, `${surface} ${model}`);
+      assert.equal(out.body, body, `${surface} ${model}`);
+      assert.equal(out.compat, undefined);
+    }
+  });
+
+  test('exact beta names only: trimmed, case-sensitive, no substring or prefix match', () => {
+    const lookalikes = [
+      PER_TURN_BETA.toUpperCase(),
+      `${PER_TURN_BETA}-extra`,
+      `x-${PER_TURN_BETA}`,
+      'per-turn-control-2026-07-02',
+      'per-turn-control',
+      `${PER_TURN_BETA};q=1`,
+    ];
+    const kept = beta(lookalikes.join(','));
+    const body = perTurnBody();
+    const same = normalizeForTarget('anthropic', sonnet, kept, body);
+    assert.equal(same.headers, kept, 'look-alikes are not the beta');
+    assert.equal(same.body, body, 'and the body is left alone');
+    const spaced = beta(`  ${lookalikes[0]} ,\t${PER_TURN_BETA}\t, ${lookalikes[1]}  `);
+    assert.equal(normalizeForTarget('anthropic', sonnet, spaced, body).headers['anthropic-beta'], `${lookalikes[0]},${lookalikes[1]}`);
+    const list = { 'anthropic-beta': [`a-1,${PER_TURN_BETA}`, 'b-2'] };
+    assert.equal(normalizeForTarget('anthropic', sonnet, list, body).headers['anthropic-beta'], 'a-1,b-2', 'a repeated header is one list');
+  });
+
+  test('other headers, credentials included, pass through as they were', () => {
+    const headers = { ...beta(`${PER_TURN_BETA},${others}`), 'x-api-key': 'test-only-not-a-key', authorization: 'Bearer test-only' };
+    const out = normalizeForTarget('anthropic', sonnet, headers, perTurnBody());
+    assert.equal(out.headers['x-api-key'], 'test-only-not-a-key');
+    assert.equal(out.headers.authorization, 'Bearer test-only');
+    assert.deepEqual(Object.keys(out.headers), Object.keys(headers));
+    assert.ok(!JSON.stringify(out.compat).includes('test-only'), 'compat carries flags and counts only');
+  });
+
+  test('odd message entries and a body without messages are left alone; deterministic', () => {
+    const body = { messages: [null, 'text', ['x'], { role: 'user', output_config: { effort: 'low' } }] };
+    const before = structuredClone(body);
+    const a = normalizeForTarget('anthropic', sonnet, beta(PER_TURN_BETA), body);
+    const b = normalizeForTarget('anthropic', sonnet, beta(PER_TURN_BETA), body);
+    assert.deepEqual(a, b);
+    assert.deepEqual(a.body.messages, [null, 'text', ['x'], { role: 'user' }]);
+    assert.deepEqual(body, before);
+    const noMessages = { model: 'claude-sonnet-5' };
+    assert.equal(normalizeForTarget('anthropic', sonnet, beta(PER_TURN_BETA), noMessages).body, noMessages);
   });
 });
 
@@ -451,7 +578,7 @@ describe('apply.mjs refuses anything but the published 1.6.0 files', () => {
     });
     const r = run([dir]);
     const after = readFileSync(join(dir, 'src/router.mjs'), 'utf8');
-    const added = existsSync(join(dir, 'src/effort.mjs')) || existsSync(join(dir, 'src/models.mjs'));
+    const added = ['src/effort.mjs', 'src/compat.mjs', 'src/models.mjs'].some((f) => existsSync(join(dir, f)));
     rmSync(dir, { recursive: true });
     assert.equal(r.status, 1);
     assert.match(r.stderr, /src\/router\.mjs is not the published 1\.6\.0 file \(SHA-256 mismatch\)/);
@@ -469,6 +596,10 @@ describe('apply.mjs refuses anything but the published 1.6.0 files', () => {
     assert.match(r.stderr, /already patched/);
     const router = readFileSync(join(PKG, 'src/router.mjs'), 'utf8');
     assert.ok(router.includes('outgoing = applyEffort(outgoing, surface, effort);'));
+    assert.ok(router.includes('const sent = normalizeForTarget(surface, target, upstreamHeaders(req, target, env), body);'), 'compat patch');
+    assert.ok(router.includes('    headers: sent.headers,\n    body: JSON.stringify(sent.body),\n'), 'the upstream gets the normalized request');
+    assert.equal(readFileSync(join(PKG, 'src/effort.mjs'), 'utf8'), readFileSync(new URL('../patches/jev-router-1.6.0/effort.mjs', import.meta.url), 'utf8'));
+    assert.equal(readFileSync(join(PKG, 'src/compat.mjs'), 'utf8'), readFileSync(new URL('../patches/jev-router-1.6.0/compat.mjs', import.meta.url), 'utf8'));
     assert.ok(router.includes("req.url.replace(/^\\/v1/, '')"), 'ChatGPT path patch kept');
     assert.ok(router.includes('const target = catalogTarget(cfg.surfaces.openai, cfg.defaultTier);'), 'models patch');
     assert.ok(!router.includes('modelList'), 'no empty catalog of its own');
@@ -516,14 +647,15 @@ describe('router: tier -> model + effort', inImage, () => {
 
   /** A local upstream that records what the router sends. */
   async function fakeUpstream() {
-    /** @type {Array<{ path: string, body: any }>} */
+    /** @type {Array<{ path: string, body: any, beta: string | undefined }>} */
     const seen = [];
     const server = http.createServer((req, res) => {
       /** @type {Buffer[]} */
       const chunks = [];
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
-        seen.push({ path: req.url ?? '', body: JSON.parse(Buffer.concat(chunks).toString() || '{}') });
+        const beta = req.headers['anthropic-beta'];
+        seen.push({ path: req.url ?? '', body: JSON.parse(Buffer.concat(chunks).toString() || '{}'), beta });
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end('{"id":"fake","usage":{}}');
       });
@@ -570,7 +702,7 @@ describe('router: tier -> model + effort', inImage, () => {
     assert.equal(res.status, 200);
     assert.equal(upstream.seen.length, before + 1, 'one upstream request');
     const sent = upstream.seen.at(-1);
-    return { sent: sent.body, path: sent.path, res, logs };
+    return { sent: sent.body, path: sent.path, beta: sent.beta, res, logs };
   }
 
   const codex = (/** @type {any} */ reasoning, extra = {}) => ({
@@ -682,6 +814,134 @@ describe('router: tier -> model + effort', inImage, () => {
     assert.equal(sent.output_config?.effort, undefined);
     assert.equal(sent.thinking, undefined);
     assert.equal(res.headers.get('x-jev-effort'), null);
+  });
+
+  describe('anthropic compat: per-turn control is removed for Sonnet targets only', () => {
+    const others = 'claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24';
+    const withTurn = `claude-code-20250219,${PER_TURN_BETA},interleaved-thinking-2025-05-14,effort-2025-11-24`;
+    const systemTurn = { role: 'system', content: 'test-only system text', output_config: { effort: 'medium' } };
+    /** What Claude Code sends with per-turn control: a mid-conversation system message with its own output_config. */
+    const perTurn = (/** @type {string} */ effort) => {
+      const body = claude('claude-sonnet-5', effort);
+      body.messages = [...body.messages, structuredClone(systemTurn), { role: 'user', content: 'again' }];
+      return body;
+    };
+    const doneOf = (/** @type {any[]} */ logs) => logs.find((e) => e.event === 'done');
+
+    test('Opus frontier gets effort high; nothing removed', async () => {
+      const { sent, beta, res, logs } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/messages?beta=true',
+        body: perTurn('medium'),
+        headers: { ...pin('frontier'), 'anthropic-beta': withTurn },
+      });
+      assert.equal(sent.model, 'claude-opus-5-5');
+      assert.deepEqual(sent.output_config, { effort: 'high' });
+      assert.equal(beta, withTurn);
+      assert.deepEqual(sent.messages[1], systemTurn);
+      assert.equal(res.headers.get('x-jev-effort'), 'high');
+      assert.equal(logs.find((e) => e.event === 'route').effort, 'high');
+      assert.equal(doneOf(logs).compat, undefined);
+    });
+
+    test('Sonnet balanced, effort medium: the beta and the message output_config go, the rest stays', async () => {
+      const { sent, beta, res, logs } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/messages?beta=true',
+        body: perTurn('medium'),
+        headers: { ...pin('balanced'), 'anthropic-beta': withTurn },
+      });
+      assert.equal(sent.model, 'claude-sonnet-5');
+      assert.deepEqual(sent.output_config, { effort: 'medium' }, 'top-level effort kept');
+      assert.deepEqual(sent.thinking, { type: 'adaptive', display: 'omitted' });
+      assert.equal(beta, others, 'other betas kept, in order');
+      assert.equal(sent.messages.length, 3);
+      assert.deepEqual(sent.messages[1], { role: 'system', content: 'test-only system text' });
+      assert.deepEqual(sent.messages[2], { role: 'user', content: 'again' });
+      assert.equal(res.headers.get('x-jev-effort'), 'medium');
+      assert.deepEqual(doneOf(logs).compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: false });
+    });
+
+    test('a Sonnet target without its own effort keeps the client effort', async () => {
+      const cfg = exampleConfig(upstream.url, (c) => delete c.surfaces.anthropic.balanced.effort);
+      const { sent, beta } = await route(upstream, cfg, {
+        path: '/v1/messages?beta=true',
+        body: perTurn('medium'),
+        headers: { ...pin('balanced'), 'anthropic-beta': withTurn },
+      });
+      assert.deepEqual(sent.output_config, { effort: 'medium' });
+      assert.equal(beta, others);
+      assert.ok(!('output_config' in sent.messages[1]));
+    });
+
+    test('a header with only the per-turn beta is removed', async () => {
+      const { beta } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/messages?beta=true',
+        body: perTurn('medium'),
+        headers: { ...pin('balanced'), 'anthropic-beta': PER_TURN_BETA },
+      });
+      assert.equal(beta, undefined);
+    });
+
+    test('Sonnet without the beta: header and messages as the client sent them', async () => {
+      const spaced = 'claude-code-20250219, effort-2025-11-24';
+      const { sent, beta, logs } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/messages?beta=true',
+        body: perTurn('medium'),
+        headers: { ...pin('balanced'), 'anthropic-beta': spaced },
+      });
+      assert.equal(beta, spaced);
+      assert.deepEqual(sent.messages[1], systemTurn);
+      assert.equal(doneOf(logs).compat, undefined);
+    });
+
+    for (const [name, tier, model] of [
+      ['Opus frontier', 'frontier', 'claude-opus-5-5'],
+      ['Opus deep', 'deep', 'claude-opus-5-5'],
+    ]) {
+      test(`${name} keeps the beta and the message output_config`, async () => {
+        const { sent, beta, logs } = await route(upstream, exampleConfig(upstream.url), {
+          path: '/v1/messages?beta=true',
+          body: perTurn('medium'),
+          headers: { ...pin(tier), 'anthropic-beta': withTurn },
+        });
+        assert.equal(sent.model, model);
+        assert.equal(beta, withTurn);
+        assert.deepEqual(sent.messages[1], systemTurn);
+        assert.equal(doneOf(logs).compat, undefined);
+      });
+    }
+
+    test('Haiku fast keeps the beta; its system messages are folded as before, no compat', async () => {
+      const { sent, beta, logs } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/messages?beta=true',
+        body: perTurn('medium'),
+        headers: { ...pin('fast'), 'anthropic-beta': withTurn },
+      });
+      assert.equal(sent.model, 'claude-haiku-4-5');
+      assert.equal(beta, withTurn);
+      assert.ok(!sent.messages.some((m) => m.role === 'system'), 'the router folds system messages for Haiku (unchanged)');
+      assert.equal(sent.output_config?.effort, undefined);
+      assert.equal(doneOf(logs).compat, undefined);
+    });
+
+    test('OpenAI keeps the header as sent', async () => {
+      const { beta } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/responses',
+        body: codex({ effort: 'medium' }),
+        headers: { ...pin('balanced'), 'anthropic-beta': withTurn },
+      });
+      assert.equal(beta, withTurn);
+    });
+
+    test('the logs carry compat flags only: no beta list, message text or credential', async () => {
+      const { logs } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/messages?beta=true',
+        body: perTurn('medium'),
+        headers: { ...pin('balanced'), 'anthropic-beta': withTurn, authorization: 'Bearer test-only' },
+      });
+      assert.ok(doneOf(logs).compat);
+      const text = JSON.stringify(logs);
+      for (const leak of [PER_TURN_BETA, 'test-only', 'authorization', 'again']) assert.ok(!text.includes(leak), leak);
+    });
   });
 
   test('anthropic side call (Haiku) stays without effort', async () => {

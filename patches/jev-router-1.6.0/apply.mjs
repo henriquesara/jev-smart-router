@@ -5,6 +5,7 @@
 //   3. GET /v1/models: Codex's model catalog, relayed from the upstream only when it holds models (models.mjs).
 //   4. Live view: the reasoning effort of each request, from the log's `effort` field (ui-effort.js).
 //   5. Live view: the focused route is highlighted over the graph's own edges (ui-route.js).
+//   6. Anthropic compatibility: features the target model rejects are removed before the upstream (compat.mjs).
 //
 // Usage: node apply.mjs <package dir>
 //
@@ -35,7 +36,7 @@ const EDITS = {
   'src/router.mjs': [
     [
       "import { applyPolicy, buildState, JevClient } from './jev.mjs';\n",
-      "import { applyPolicy, buildState, JevClient } from './jev.mjs';\nimport { applyEffort, effortFor } from './effort.mjs';\nimport { CATALOG_HEADERS, MAX_CATALOG_BYTES, catalogBody, catalogPath, catalogTarget } from './models.mjs';\n",
+      "import { applyPolicy, buildState, JevClient } from './jev.mjs';\nimport { applyEffort, effortFor } from './effort.mjs';\nimport { normalizeForTarget } from './compat.mjs';\nimport { CATALOG_HEADERS, MAX_CATALOG_BYTES, catalogBody, catalogPath, catalogTarget } from './models.mjs';\n",
     ],
     // 1. ChatGPT backend path.
     [
@@ -121,7 +122,10 @@ const EDITS = {
       '  async function relay(req, res, { id, target, surface, session, shown, signal, startedAt, body, redacted, capped, folded }) {\n',
       '  async function relay(req, res, { id, target, surface, session, shown, signal, startedAt, body, redacted, capped, folded, effort }) {\n',
     ],
-    ['      model: target.model,\n      ms: elapsed(startedAt),\n', '      model: target.model,\n      effort,\n      ms: elapsed(startedAt),\n'],
+    [
+      '      model: target.model,\n      ms: elapsed(startedAt),\n',
+      '      model: target.model,\n      effort,\n      compat: result.compat,\n      ms: elapsed(startedAt),\n',
+    ],
     [
       'function prepareBody(body, text, target, anchor) {\n',
       'function prepareBody(body, text, target, anchor, surface, effort) {\n',
@@ -135,6 +139,22 @@ const EDITS = {
       '  return { body: folded.body, redacted, capped: capped.capped, folded: folded.folded };\n',
       '  return { body: folded.body, redacted, capped: capped.capped, folded: folded.folded, effort };\n',
     ],
+    // 6. Anthropic compatibility per target model (compat.mjs): forward() gets the surface, sends the
+    // normalized headers and body, and returns what was removed for the done log (flags, no values).
+    [
+      '      result = await forward(req, res, target, body, shown, signal, env);\n',
+      '      result = await forward(req, res, target, body, shown, signal, env, surface);\n',
+    ],
+    [
+      'async function forward(req, res, target, body, shown, signal, env) {\n',
+      'async function forward(req, res, target, body, shown, signal, env, surface) {\n' +
+        '  const sent = normalizeForTarget(surface, target, upstreamHeaders(req, target, env), body);\n',
+    ],
+    [
+      '    headers: upstreamHeaders(req, target, env),\n    body: JSON.stringify(body),\n',
+      '    headers: sent.headers,\n    body: JSON.stringify(sent.body),\n',
+    ],
+    ['    broken: Boolean(broke),\n    error,\n  };\n', '    broken: Boolean(broke),\n    error,\n    compat: sent.compat,\n  };\n'],
   ],
   'src/config.mjs': [
     ["import { homedir } from 'node:os';\n", "import { homedir } from 'node:os';\nimport { effortProblems } from './effort.mjs';\n"],
@@ -459,7 +479,7 @@ if (!pkgDir) fail('usage: node apply.mjs <package dir>');
 const pkg = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
 if (pkg.name !== '@ediri/jev-router' || pkg.version !== VERSION)
   fail(`expected @ediri/jev-router@${VERSION}, found ${pkg.name}@${pkg.version}; update the patch for the new version`);
-for (const added of ['src/effort.mjs', 'src/models.mjs', 'ui/effort.js', 'ui/route.js'])
+for (const added of ['src/effort.mjs', 'src/compat.mjs', 'src/models.mjs', 'ui/effort.js', 'ui/route.js'])
   if (existsSync(join(pkgDir, added))) fail(`${added} already exists: the package is already patched or not pristine`);
 
 /** @type {Record<string, string>} */
@@ -478,6 +498,7 @@ for (const [file, edits] of Object.entries(EDITS)) {
 
 for (const [file, text] of Object.entries(patched)) writeFileSync(join(pkgDir, file), text);
 writeFileSync(join(pkgDir, 'src/effort.mjs'), readFileSync(join(here, 'effort.mjs'), 'utf8'));
+writeFileSync(join(pkgDir, 'src/compat.mjs'), readFileSync(join(here, 'compat.mjs'), 'utf8'));
 writeFileSync(join(pkgDir, 'src/models.mjs'), readFileSync(join(here, 'models.mjs'), 'utf8'));
 writeFileSync(join(pkgDir, 'ui/effort.js'), readFileSync(join(here, 'ui-effort.js'), 'utf8'));
 writeFileSync(join(pkgDir, 'ui/route.js'), readFileSync(join(here, 'ui-route.js'), 'utf8'));
@@ -488,4 +509,4 @@ await import(pathToFileURL(join(pkgDir, 'src/router.mjs')).href);
 await import(pathToFileURL(join(pkgDir, 'src/ui.mjs')).href);
 await import(pathToFileURL(join(pkgDir, 'ui/effort.js')).href);
 await import(pathToFileURL(join(pkgDir, 'ui/route.js')).href);
-console.log(`jev-router patch: ${VERSION} patched (chatgpt-path, effort, models, live-view effort and route)`);
+console.log(`jev-router patch: ${VERSION} patched (chatgpt-path, effort, models, live-view effort and route, anthropic compat)`);
