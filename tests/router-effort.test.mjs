@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { normalizeForTarget, PER_TURN_BETA } from '../patches/jev-router-1.6.0/compat.mjs';
+import { normalizeForTarget, PER_TURN_BETA, TOOL_CHANGES_BETA } from '../patches/jev-router-1.6.0/compat.mjs';
 import { applyEffort, EFFORTS, effortFor, effortProblems, isEffort, supportsEffort } from '../patches/jev-router-1.6.0/effort.mjs';
 import { CATALOG_HEADERS, MAX_CATALOG_BYTES, catalogBody, catalogPath, catalogTarget } from '../patches/jev-router-1.6.0/models.mjs';
 import {
@@ -153,7 +153,7 @@ describe('compat.mjs: normalizeForTarget (Sonnet and per-turn control)', () => {
     assert.equal(outMessages.length, inMessages.length);
     assert.equal(outMessages[0], body.messages[0], 'untouched messages are the same objects');
     assert.equal(outMessages[2], body.messages[2]);
-    assert.deepEqual(out.compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: false });
+    assert.deepEqual(out.compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: false, toolAdditionBlocksRemoved: 0, toolRemovalBlocksRemoved: 0 });
     assert.deepEqual({ headers, body }, before, 'inputs not mutated');
   });
 
@@ -162,7 +162,7 @@ describe('compat.mjs: normalizeForTarget (Sonnet and per-turn control)', () => {
     const out = normalizeForTarget('anthropic', sonnet, beta(`${PER_TURN_BETA},${others}`), body);
     assert.equal(out.body, body);
     assert.equal(out.headers['anthropic-beta'], others);
-    assert.deepEqual(out.compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 0, midConversationToolChangesRemoved: false });
+    assert.deepEqual(out.compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 0, midConversationToolChangesRemoved: false, toolAdditionBlocksRemoved: 0, toolRemovalBlocksRemoved: 0 });
   });
 
   test('a header with only that beta is removed', () => {
@@ -242,6 +242,155 @@ describe('compat.mjs: normalizeForTarget (Sonnet and per-turn control)', () => {
     assert.deepEqual(body, before);
     const noMessages = { model: 'claude-sonnet-5' };
     assert.equal(normalizeForTarget('anthropic', sonnet, beta(PER_TURN_BETA), noMessages).body, noMessages);
+  });
+});
+
+describe('compat.mjs: normalizeForTarget (Sonnet and mid-conversation tool changes)', () => {
+  const others = 'claude-code-20250219,effort-2025-11-24';
+  const beta = (/** @type {string} */ value) => ({ 'content-type': 'application/json', 'anthropic-beta': value });
+  const sonnet = { model: 'claude-sonnet-5' };
+  const addition = (/** @type {string} */ name) => ({ type: 'tool_addition', tool: { type: 'tool_reference', name } });
+  const removal = (/** @type {string} */ name) => ({ type: 'tool_removal', tool: { type: 'tool_reference', name } });
+  /** The shape Claude Code sends with tool changes: a mid-conversation system message with text and three tool_addition blocks referring to tools in `tools`. Test data. */
+  const toolsBody = () => ({
+    model: 'claude-sonnet-5',
+    max_tokens: 1024,
+    thinking: { type: 'adaptive', display: 'omitted' },
+    context_management: { edits: [{ type: 'clear_thinking_20251015' }] },
+    output_config: { effort: 'medium' },
+    tools: [
+      { name: 'tool_a', input_schema: { type: 'object' } },
+      { name: 'tool_b', input_schema: { type: 'object' } },
+      { name: 'tool_c', input_schema: { type: 'object' } },
+    ],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+      {
+        role: 'system',
+        content: [{ type: 'text', text: 'test-only system text' }, addition('tool_a'), addition('tool_b'), addition('tool_c')],
+      },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+    ],
+  });
+  const compat = (/** @type {Partial<import('../patches/jev-router-1.6.0/compat.mjs').Compat>} */ over) => ({
+    perTurnControlRemoved: false,
+    messageOutputConfigRemoved: 0,
+    midConversationToolChangesRemoved: true,
+    toolAdditionBlocksRemoved: 0,
+    toolRemovalBlocksRemoved: 0,
+    ...over,
+  });
+
+  test('Sonnet with the beta and three tool_addition: the beta and the blocks go, text and tools stay', () => {
+    const headers = beta(`claude-code-20250219,${TOOL_CHANGES_BETA},effort-2025-11-24`);
+    const body = toolsBody();
+    const before = structuredClone({ headers, body });
+    const out = normalizeForTarget('anthropic', sonnet, headers, body);
+    assert.deepEqual(out.headers, { 'content-type': 'application/json', 'anthropic-beta': others }, 'other betas keep their order');
+    assert.deepEqual(out.body.messages[1], { role: 'system', content: [{ type: 'text', text: 'test-only system text' }] });
+    assert.equal(out.body.tools, body.tools, 'top-level tools: the same array');
+    assert.deepEqual(out.body.tools, before.body.tools);
+    const { messages: outMessages, ...outRest } = out.body;
+    const { messages: inMessages, ...inRest } = before.body;
+    assert.deepEqual(outRest, inRest, 'output_config.effort, thinking, context_management and the rest unchanged');
+    assert.equal(outMessages.length, inMessages.length);
+    assert.equal(outMessages[0], body.messages[0], 'user and assistant messages are the same objects');
+    assert.equal(outMessages[2], body.messages[2]);
+    assert.deepEqual(out.compat, compat({ toolAdditionBlocksRemoved: 3 }));
+    assert.deepEqual({ headers, body }, before, 'inputs not mutated');
+  });
+
+  test('tool_removal blocks go too, and are counted apart; other block types stay', () => {
+    const body = toolsBody();
+    const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA==' } };
+    body.messages[1].content = [removal('tool_a'), { type: 'text', text: 'test-only' }, image, addition('tool_b')];
+    const out = normalizeForTarget('anthropic', sonnet, beta(TOOL_CHANGES_BETA), body);
+    assert.deepEqual(out.body.messages[1].content, [{ type: 'text', text: 'test-only' }, image]);
+    assert.deepEqual(out.compat, compat({ toolAdditionBlocksRemoved: 1, toolRemovalBlocksRemoved: 1 }));
+    assert.ok(!('anthropic-beta' in out.headers), 'a header with only that beta is removed');
+  });
+
+  test('a system message with only tool changes is dropped whole; a string or empty content is left alone', () => {
+    const body = toolsBody();
+    body.messages[1].content = [addition('tool_a'), removal('tool_b')];
+    body.messages.push({ role: 'system', content: 'test-only string' }, { role: 'system', content: [] });
+    const out = normalizeForTarget('anthropic', sonnet, beta(TOOL_CHANGES_BETA), body);
+    assert.deepEqual(out.body.messages.map((m) => m.role), ['user', 'assistant', 'system', 'system']);
+    assert.equal(out.body.messages[2], body.messages[3]);
+    assert.equal(out.body.messages[3], body.messages[4], 'already empty: not ours to drop');
+    assert.deepEqual(out.compat, compat({ toolAdditionBlocksRemoved: 1, toolRemovalBlocksRemoved: 1 }));
+    assert.equal(body.messages.length, 5, 'input not mutated');
+  });
+
+  test('only system messages: tool change blocks in user or assistant messages stay', () => {
+    const body = toolsBody();
+    body.messages[0].content.push(addition('tool_a'));
+    body.messages[2].content.push(removal('tool_b'));
+    const out = normalizeForTarget('anthropic', sonnet, beta(TOOL_CHANGES_BETA), body);
+    assert.equal(out.body.messages[0], body.messages[0]);
+    assert.equal(out.body.messages[2], body.messages[2]);
+    assert.deepEqual(out.compat, compat({ toolAdditionBlocksRemoved: 3 }));
+  });
+
+  test('the beta with no tool change blocks: the beta goes, the body is the same object', () => {
+    const body = { model: 'claude-sonnet-5', messages: [{ role: 'system', content: [{ type: 'text', text: 'x' }] }] };
+    const out = normalizeForTarget('anthropic', sonnet, beta(`${TOOL_CHANGES_BETA},${others}`), body);
+    assert.equal(out.body, body);
+    assert.equal(out.headers['anthropic-beta'], others);
+    assert.deepEqual(out.compat, compat({}));
+  });
+
+  test('Sonnet without that beta: blocks, headers and body unchanged, the same objects', () => {
+    for (const headers of [beta(others), { 'content-type': 'application/json' }]) {
+      const body = toolsBody();
+      const out = normalizeForTarget('anthropic', sonnet, headers, body);
+      assert.equal(out.headers, headers);
+      assert.equal(out.body, body);
+      assert.equal(out.compat, undefined);
+    }
+    const body = toolsBody();
+    const perTurnOnly = normalizeForTarget('anthropic', sonnet, beta(PER_TURN_BETA), body);
+    assert.equal(perTurnOnly.body, body, 'the per-turn rule leaves the tool blocks alone');
+    assert.equal(perTurnOnly.compat?.midConversationToolChangesRemoved, false);
+  });
+
+  test('exact beta name only: look-alikes leave everything alone', () => {
+    for (const lookalike of [TOOL_CHANGES_BETA.toUpperCase(), `${TOOL_CHANGES_BETA}-extra`, 'mid-conversation-tool-changes-2026-07-02', 'mid-conversation-tool-changes']) {
+      const body = toolsBody();
+      const headers = beta(lookalike);
+      const out = normalizeForTarget('anthropic', sonnet, headers, body);
+      assert.equal(out.body, body, lookalike);
+      assert.equal(out.headers, headers, lookalike);
+    }
+  });
+
+  test('Opus, Haiku, OpenAI: nothing removed', () => {
+    const headers = beta(`${TOOL_CHANGES_BETA},${PER_TURN_BETA},${others}`);
+    for (const [surface, model] of [
+      ['anthropic', 'claude-opus-5-5'],
+      ['anthropic', 'claude-haiku-4-5'],
+      ['openai', 'claude-sonnet-5'],
+      ['openai', 'gpt-6.1-sol'],
+    ]) {
+      const body = toolsBody();
+      const out = normalizeForTarget(/** @type {string} */ (surface), { model }, headers, body);
+      assert.equal(out.headers, headers, `${surface} ${model}`);
+      assert.equal(out.body, body, `${surface} ${model}`);
+      assert.equal(out.compat, undefined);
+    }
+  });
+
+  test('both betas: both rules apply in one pass', () => {
+    const body = toolsBody();
+    body.messages[1].output_config = { effort: 'medium' };
+    const before = structuredClone(body);
+    const out = normalizeForTarget('anthropic', sonnet, beta(`${PER_TURN_BETA},${TOOL_CHANGES_BETA},${others}`), body);
+    assert.equal(out.headers['anthropic-beta'], others);
+    assert.deepEqual(out.body.messages[1], { role: 'system', content: [{ type: 'text', text: 'test-only system text' }] });
+    assert.deepEqual(out.body.output_config, { effort: 'medium' });
+    assert.deepEqual(out.compat, compat({ perTurnControlRemoved: true, messageOutputConfigRemoved: 1, toolAdditionBlocksRemoved: 3 }));
+    assert.deepEqual(body, before, 'input not mutated');
+    assert.ok(!JSON.stringify(out.compat).includes('tool_'), 'compat carries flags and counts only');
   });
 });
 
@@ -857,8 +1006,32 @@ describe('router: tier -> model + effort', inImage, () => {
       assert.deepEqual(sent.messages[1], { role: 'system', content: 'test-only system text' });
       assert.deepEqual(sent.messages[2], { role: 'user', content: 'again' });
       assert.equal(res.headers.get('x-jev-effort'), 'medium');
-      assert.deepEqual(doneOf(logs).compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: false });
+      assert.deepEqual(doneOf(logs).compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: false, toolAdditionBlocksRemoved: 0, toolRemovalBlocksRemoved: 0 });
     });
+
+    for (const client of [undefined, 'high']) {
+      test(`Sonnet balanced, client effort ${client ?? 'absent'}: the router sets medium, compat still removes per-turn control`, async () => {
+        const body = perTurn(client);
+        assert.equal(body.messages[1].output_config.effort, 'medium', 'the message output_config is there to be removed');
+        const { sent, beta, res, logs } = await route(upstream, exampleConfig(upstream.url), {
+          path: '/v1/messages?beta=true',
+          body,
+          headers: { ...pin('balanced'), 'anthropic-beta': withTurn },
+        });
+        assert.equal(sent.model, 'claude-sonnet-5');
+        assert.deepEqual(sent.output_config, { effort: 'medium' }, 'top-level effort from the router');
+        assert.deepEqual(sent.thinking, { type: 'adaptive', display: 'omitted' });
+        assert.equal(beta, others, 'only the per-turn beta removed');
+        assert.deepEqual(sent.messages[1], { role: 'system', content: 'test-only system text' });
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get('x-jev-effort'), 'medium');
+        assert.equal(logs.find((e) => e.event === 'route').effort, 'medium', 'the router applied medium');
+        const done = doneOf(logs);
+        assert.equal(done.effort, 'medium');
+        assert.equal(done.status, 200);
+        assert.deepEqual(done.compat, { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: false, toolAdditionBlocksRemoved: 0, toolRemovalBlocksRemoved: 0 });
+      });
+    }
 
     test('a Sonnet target without its own effort keeps the client effort', async () => {
       const cfg = exampleConfig(upstream.url, (c) => delete c.surfaces.anthropic.balanced.effort);
@@ -941,6 +1114,71 @@ describe('router: tier -> model + effort', inImage, () => {
       assert.ok(doneOf(logs).compat);
       const text = JSON.stringify(logs);
       for (const leak of [PER_TURN_BETA, 'test-only', 'authorization', 'again']) assert.ok(!text.includes(leak), leak);
+    });
+
+    /** Claude Code 2.1.286 with both betas: the system message carries output_config and three tool_addition referring to tools in `tools`. */
+    const bothBetas = `claude-code-20250219,${PER_TURN_BETA},${TOOL_CHANGES_BETA},interleaved-thinking-2025-05-14,effort-2025-11-24`;
+    const toolChanges = (/** @type {string | undefined} */ effort) => {
+      const body = perTurn(effort);
+      body.tools = ['test_tool_a', 'test_tool_b', 'test_tool_c'].map((name) => ({ name, description: 'test', input_schema: { type: 'object' } }));
+      body.messages[1].content = [
+        { type: 'text', text: 'test-only system text' },
+        ...body.tools.map((t) => ({ type: 'tool_addition', tool: { type: 'tool_reference', name: t.name } })),
+      ];
+      return body;
+    };
+
+    test('Sonnet balanced with tool changes: both betas and the tool_addition blocks go, tools and medium stay', async () => {
+      const body = toolChanges(undefined);
+      const { sent, beta, res, logs } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/messages?beta=true',
+        body,
+        headers: { ...pin('balanced'), 'anthropic-beta': bothBetas },
+      });
+      assert.equal(sent.model, 'claude-sonnet-5');
+      assert.equal(beta, others, 'only the two betas removed, the rest in order');
+      assert.deepEqual(sent.output_config, { effort: 'medium' }, 'top-level effort from the router');
+      assert.deepEqual(sent.thinking, { type: 'adaptive', display: 'omitted' });
+      assert.deepEqual(sent.tools, body.tools, 'top-level tools as the client sent them');
+      assert.deepEqual(sent.messages[1], { role: 'system', content: [{ type: 'text', text: 'test-only system text' }] });
+      assert.deepEqual(sent.messages[2], { role: 'user', content: 'again' });
+      assert.equal(res.status, 200);
+      const done = doneOf(logs);
+      assert.equal(done.effort, 'medium');
+      assert.deepEqual(done.compat, {
+        perTurnControlRemoved: true,
+        messageOutputConfigRemoved: 1,
+        midConversationToolChangesRemoved: true,
+        toolAdditionBlocksRemoved: 3,
+        toolRemovalBlocksRemoved: 0,
+      });
+      const text = JSON.stringify(logs);
+      for (const leak of [TOOL_CHANGES_BETA, 'test_tool_a', 'test-only']) assert.ok(!text.includes(leak), leak);
+    });
+
+    test('Opus frontier with tool changes: betas, blocks and messages as sent', async () => {
+      const body = toolChanges('medium');
+      const { sent, beta, logs } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/messages?beta=true',
+        body,
+        headers: { ...pin('frontier'), 'anthropic-beta': bothBetas },
+      });
+      assert.equal(sent.model, 'claude-opus-5-5');
+      assert.equal(beta, bothBetas);
+      assert.deepEqual(sent.messages[1], body.messages[1]);
+      assert.equal(doneOf(logs).compat, undefined);
+    });
+
+    test('Haiku fast with tool changes: betas kept, the router folds as before, no compat', async () => {
+      const { sent, beta, logs } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/messages?beta=true',
+        body: toolChanges('medium'),
+        headers: { ...pin('fast'), 'anthropic-beta': bothBetas },
+      });
+      assert.equal(sent.model, 'claude-haiku-4-5');
+      assert.equal(beta, bothBetas);
+      assert.ok(!sent.messages.some((m) => m.role === 'system'));
+      assert.equal(doneOf(logs).compat, undefined);
     });
   });
 

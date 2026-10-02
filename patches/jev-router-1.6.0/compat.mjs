@@ -11,9 +11,20 @@
 //     Sent: 400 "messages.1.output_config: Extra inputs are not permitted" (the beta alone dropped),
 //     or 400 "output_config.effort requires a model that supports per-turn effort" (as sent).
 //     The retry without both: 200. The top-level output_config.effort is the same in both.
+//
+//   claude-sonnet-* with mid-conversation tool changes (observed: Claude Code 2.1.286, claude-sonnet-5):
+//     the mid-conversation tool changes beta, and the `tool_addition` / `tool_removal` content blocks
+//     of `role: system` messages. Sent: 400 "tool_addition/tool_removal is not supported on this
+//     model". The retry: 200, without the beta and without the three `tool_addition` blocks (each a
+//     `tool_reference` to a tool already in the top-level `tools`), `tools` identical. Only
+//     `tool_addition` was seen; `tool_removal` is the other block the error names. A system message
+//     left with no content block at all is dropped whole: the API takes no empty content.
 
 /** Claude Code's per-turn control beta. */
 export const PER_TURN_BETA = 'per-turn-control-2026-07-01';
+
+/** Claude Code's mid-conversation tool changes beta. */
+export const TOOL_CHANGES_BETA = 'mid-conversation-tool-changes-2026-07-01';
 
 const SONNET = /^claude-sonnet-/;
 
@@ -31,7 +42,13 @@ const isPlainObject = (value) => typeof value === 'object' && value !== null && 
 const betaNames = (value) => (Array.isArray(value) ? value.join(',') : String(value)).split(',').map((beta) => beta.trim());
 
 /**
- * @typedef {{ perTurnControlRemoved: boolean, messageOutputConfigRemoved: number, midConversationToolChangesRemoved: boolean }} Compat
+ * @typedef {{
+ *   perTurnControlRemoved: boolean,
+ *   messageOutputConfigRemoved: number,
+ *   midConversationToolChangesRemoved: boolean,
+ *   toolAdditionBlocksRemoved: number,
+ *   toolRemovalBlocksRemoved: number,
+ * }} Compat
  * What was removed, for the log: flags and counts only, never a value.
  */
 
@@ -53,29 +70,65 @@ export function normalizeForTarget(surface, target, headers, body) {
   const value = headers['anthropic-beta'];
   if (value === undefined) return same;
   const betas = betaNames(value);
-  if (!betas.includes(PER_TURN_BETA)) return same;
+  const perTurn = betas.includes(PER_TURN_BETA);
+  const toolChanges = betas.includes(TOOL_CHANGES_BETA);
+  if (!perTurn && !toolChanges) return same;
 
-  const kept = betas.filter((beta) => beta && beta !== PER_TURN_BETA);
+  const kept = betas.filter((beta) => beta && beta !== PER_TURN_BETA && beta !== TOOL_CHANGES_BETA);
   /** @type {Record<string, string | string[]>} */
   const outHeaders = { ...headers };
   if (kept.length > 0) outHeaders['anthropic-beta'] = kept.join(',');
   else delete outHeaders['anthropic-beta'];
 
-  let removed = 0;
+  let outputConfigs = 0;
+  let additions = 0;
+  let removals = 0;
+  let changed = false;
   let outBody = body;
   if (Array.isArray(body.messages)) {
-    const messages = body.messages.map((message) => {
-      if (!isPlainObject(message) || !Object.hasOwn(message, 'output_config')) return message;
-      removed += 1;
-      const { output_config: _, ...rest } = message;
-      return rest;
-    });
-    if (removed > 0) outBody = { ...body, messages };
+    /** @type {unknown[]} */
+    const messages = [];
+    for (const message of body.messages) {
+      if (!isPlainObject(message)) {
+        messages.push(message);
+        continue;
+      }
+      let out = message;
+      if (perTurn && Object.hasOwn(out, 'output_config')) {
+        outputConfigs += 1;
+        const { output_config: _, ...rest } = out;
+        out = rest;
+      }
+      if (toolChanges && out.role === 'system' && Array.isArray(out.content)) {
+        const content = out.content.filter((block) => {
+          const type = isPlainObject(block) ? block.type : undefined;
+          if (type === 'tool_addition') additions += 1;
+          else if (type === 'tool_removal') removals += 1;
+          else return true;
+          return false;
+        });
+        if (content.length !== out.content.length) {
+          if (content.length === 0) {
+            changed = true;
+            continue;
+          }
+          out = { ...out, content };
+        }
+      }
+      if (out !== message) changed = true;
+      messages.push(out);
+    }
+    if (changed) outBody = /** @type {B} */ ({ ...body, messages });
   }
   return {
     headers: /** @type {H} */ (outHeaders),
     body: outBody,
-    // No rule removes mid-conversation tool changes yet: no evidence that ties a field to it.
-    compat: { perTurnControlRemoved: true, messageOutputConfigRemoved: removed, midConversationToolChangesRemoved: false },
+    compat: {
+      perTurnControlRemoved: perTurn,
+      messageOutputConfigRemoved: outputConfigs,
+      midConversationToolChangesRemoved: toolChanges,
+      toolAdditionBlocksRemoved: additions,
+      toolRemovalBlocksRemoved: removals,
+    },
   };
 }

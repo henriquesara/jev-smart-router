@@ -590,10 +590,13 @@ O Claude Code monta cada pedido para o modelo que ele acredita usar, mas o route
 | Modelo alvo | Condição | Removido | Preservado |
 | --- | --- | --- | --- |
 | `claude-sonnet-*` | `anthropic-beta` contém exatamente `per-turn-control-2026-07-01` | esse beta; `output_config` dentro de cada item de `messages[]` | `output_config` de nível superior (effort), `thinking`, `context_management`, `tools`, demais betas (em ordem) e demais campos das mensagens |
+| `claude-sonnet-*` | `anthropic-beta` contém exatamente `mid-conversation-tool-changes-2026-07-01` | esse beta; blocos `tool_addition` e `tool_removal` do `content` das mensagens `role: system` | `tools` de nível superior (o mesmo array), blocos `text` e outros tipos, mensagens `user`/`assistant`, effort, `thinking`, `context_management`, demais betas |
 
+- As duas regras são independentes e podem valer no mesmo pedido.
+- Evidência da segunda regra: Claude Code 2.1.286 enviou ao `claude-sonnet-5` uma mensagem `system` com `text` e três `tool_addition`, todas do subtipo `tool_reference` para ferramentas que já estavam em `tools` (17). A API respondeu `400 tool_addition/tool_removal is not supported on this model`. A repetição do próprio cliente, sem o beta e sem os três blocos, com `tools` idêntico (mesmo hash), recebeu `200`. Só `tool_addition` foi observado. `tool_removal` é removido porque o erro o cita junto.
+- Se uma mensagem `system` ficar sem nenhum bloco depois da remoção, ela é retirada inteira, porque a API não aceita `content` vazio. Uma mensagem com `content` em string ou já vazia fica como veio.
 - Opus, Haiku e OpenAI não passam por nenhuma regra. No Haiku, o dobramento das mensagens `system`, que já existia no router, continua igual.
-- `mid-conversation-tool-changes-2026-07-01` **não** é removido. O `400 tool_addition/tool_removal` só apareceu numa execução, sem captura da forma do pedido, e não se reproduziu depois. Por isso ainda não há evidência para uma regra.
-- O log `done` traz apenas flags e contagens, por exemplo `compat: { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: false }`. Não registra betas, texto nem headers.
+- O log `done` traz apenas flags e contagens, por exemplo `compat: { perTurnControlRemoved: true, messageOutputConfigRemoved: 1, midConversationToolChangesRemoved: true, toolAdditionBlocksRemoved: 3, toolRemovalBlocksRemoved: 0 }`. Não registra betas, nomes de ferramentas, texto nem headers.
 
 Validação real (Claude Code 2.1.286): `routine → balanced → claude-sonnet-5` com effort `medium` recebeu `200` no **primeiro** pedido ao upstream.
 
