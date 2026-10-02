@@ -6,6 +6,7 @@
 //   4. Live view: the reasoning effort of each request, from the log's `effort` field (ui-effort.js).
 //   5. Live view: the focused route is highlighted over the graph's own edges (ui-route.js).
 //   6. Anthropic compatibility: features the target model rejects are removed before the upstream (compat.mjs).
+//   7. Project and instance of each request, for the logs and the live view only (project.mjs, ui-project.js).
 //
 // Usage: node apply.mjs <package dir>
 //
@@ -36,7 +37,8 @@ const EDITS = {
   'src/router.mjs': [
     [
       "import { applyPolicy, buildState, JevClient } from './jev.mjs';\n",
-      "import { applyPolicy, buildState, JevClient } from './jev.mjs';\nimport { applyEffort, effortFor } from './effort.mjs';\nimport { normalizeForTarget } from './compat.mjs';\nimport { CATALOG_HEADERS, MAX_CATALOG_BYTES, catalogBody, catalogPath, catalogTarget } from './models.mjs';\n",
+      "import { applyPolicy, buildState, JevClient } from './jev.mjs';\nimport { applyEffort, effortFor } from './effort.mjs';\nimport { normalizeForTarget } from './compat.mjs';\nimport { CATALOG_HEADERS, MAX_CATALOG_BYTES, catalogBody, catalogPath, catalogTarget } from './models.mjs';\n" +
+        "import { PROJECT_HEADERS, isLoopbackHost, projectFields, takeProject } from './project.mjs';\n",
     ],
     // 1. ChatGPT backend path.
     [
@@ -96,7 +98,7 @@ const EDITS = {
         '    } catch {\n' +
         '      body = undefined;\n' +
         '    }\n' +
-        "    log({ ts: new Date().toISOString(), event: 'models', upstream: host, status, relayed: body !== undefined });\n" +
+        "    log({ ts: new Date().toISOString(), event: 'models', ...projectFields(req), upstream: host, status, relayed: body !== undefined });\n" +
         "    if (body === undefined) return fail(res, 404, `No model catalog from ${host} (status ${status || 'none'})`, 'openai');\n" +
         "    res.writeHead(200, { ...relayed, 'content-type': 'application/json', 'cache-control': 'no-store' });\n" +
         '    res.end(body);\n' +
@@ -155,6 +157,43 @@ const EDITS = {
       '    headers: sent.headers,\n    body: JSON.stringify(sent.body),\n',
     ],
     ['    broken: Boolean(broke),\n    error,\n  };\n', '    broken: Boolean(broke),\n    error,\n    compat: sent.compat,\n  };\n'],
+    // 7. Project and instance (project.mjs): the /_jev/ prefix comes off the path and the project
+    // headers off the request before anything else reads them; the log lines name the project.
+    [
+      "      return fail(res, 403, 'Cross-origin requests are not allowed');\n",
+      "      return fail(res, 403, 'Cross-origin requests are not allowed');\n" +
+        '    // jev-router-project: before /healthz and the routes, so a prefixed path is the plain path.\n' +
+        "    if (!takeProject(req, isLoopbackHost(host))) return fail(res, 400, 'Malformed /_jev/ project prefix');\n",
+    ],
+    [
+      "const DROP_REQUEST = new Set([...HOP, 'accept-encoding', 'authorization', 'x-api-key', 'x-jev-tier', 'x-jev-router-token']);\n",
+      "const DROP_REQUEST = new Set([...HOP, 'accept-encoding', 'authorization', 'x-api-key', 'x-jev-tier', 'x-jev-router-token', ...PROJECT_HEADERS]);\n",
+    ],
+    [
+      '      req: id,\n      session,\n      path,\n      kind: decision.kind,\n',
+      '      req: id,\n      session,\n      ...projectFields(req),\n      path,\n      kind: decision.kind,\n',
+    ],
+    ['        req: id,\n        session,\n        status: 499,\n', '        req: id,\n        session,\n        ...projectFields(req),\n        status: 499,\n'],
+    [
+      "log({ ts: ts(), event: 'done', req: id, session, status: 499, client_aborted: true, ms: elapsed(startedAt) });",
+      "log({ ts: ts(), event: 'done', req: id, session, ...projectFields(req), status: 499, client_aborted: true, ms: elapsed(startedAt) });",
+    ],
+    [
+      "log({ ts: ts(), event: 'error', req: id, session, error: `upstream ${why}` });",
+      "log({ ts: ts(), event: 'error', req: id, session, ...projectFields(req), error: `upstream ${why}` });",
+    ],
+    [
+      "log({ ts: ts(), event: 'error', req: id, session, error: result.error ?? 'the upstream stream broke off' });",
+      "log({ ts: ts(), event: 'error', req: id, session, ...projectFields(req), error: result.error ?? 'the upstream stream broke off' });",
+    ],
+    [
+      "      event: 'done',\n      req: id,\n      session,\n      status: result.status,\n",
+      "      event: 'done',\n      req: id,\n      session,\n      ...projectFields(req),\n      status: result.status,\n",
+    ],
+    [
+      "log({ ts: new Date().toISOString(), event: 'error', path: req.url, error });",
+      "log({ ts: new Date().toISOString(), event: 'error', ...projectFields(req), path: req.url, error });",
+    ],
   ],
   'src/config.mjs': [
     ["import { homedir } from 'node:os';\n", "import { homedir } from 'node:os';\nimport { effortProblems } from './effort.mjs';\n"],
@@ -178,7 +217,9 @@ const EDITS = {
   // and done log lines next to the model. It never derives one from the tier.
   // 5. Live view: route.js holds the flow's edges and each request's chain of cards, so the focused
   // route's highlight is drawn over the graph's own edges (see the edits marked 5 below).
-  'src/ui.mjs': [["  '/app.js': 'app.js',\n", "  '/app.js': 'app.js',\n  '/effort.js': 'effort.js',\n  '/route.js': 'route.js',\n"]],
+  'src/ui.mjs': [
+    ["  '/app.js': 'app.js',\n", "  '/app.js': 'app.js',\n  '/effort.js': 'effort.js',\n  '/route.js': 'route.js',\n  '/project.js': 'project.js',\n"],
+  ],
   'ui/app.js': [
     [
       "const SVG_NS = 'http://www.w3.org/2000/svg';\n",
@@ -439,6 +480,109 @@ const EDITS = {
         '  const g = graph;\n' +
         '  return routeCards({ mode: g.mode, surface: rec.surface, route: rec.route, decision: decisionOf(rec).route, has: (id) => g.nodes.has(id) });\n',
     ],
+    // 7. Project: each label comes from its own route line (hero, feed row) or its own session (lane),
+    // never from another request. These anchors are the text after the edits above.
+    [
+      "import { chainEdges, edgeId, graphLinks, routeChain as routeCards } from './route.js';\n",
+      "import { chainEdges, edgeId, graphLinks, routeChain as routeCards } from './route.js';\n" +
+        "import { noteProject, projectOf, projectParts, projectTip } from './project.js';\n",
+    ],
+    [
+      ' *   reason: string, model: string, effort: string, upstream: string, trustedOnly: boolean, jev: Jev | undefined }} RouteEvent\n',
+      ' *   reason: string, model: string, effort: string, upstream: string, trustedOnly: boolean, jev: Jev | undefined,\n' +
+        ' *   project: string, projectId: string, instanceId: string }} RouteEvent\n',
+    ],
+    [
+      ' * @typedef {{ id: string, surface: string, turns: Turn[], turnCount: number, tier: string, model: string, effort: string, spend: number,\n',
+      ' * @typedef {{ id: string, surface: string, turns: Turn[], turnCount: number, tier: string, model: string, effort: string, spend: number,\n' +
+        ' *   project: import(\'./project.js\').Project | undefined,\n',
+    ],
+    [
+      "    model: str(raw.model, '?'),\n    effort: effortOf(raw),\n    upstream: str(raw.upstream),\n",
+      "    model: str(raw.model, '?'),\n    effort: effortOf(raw),\n    ...projectOf(raw),\n    upstream: str(raw.upstream),\n",
+    ],
+    [
+      '  state.seenSurfaces.add(surface);\n',
+      '  state.seenSurfaces.add(surface);\n  if (noteProject(projects, route)) relabelProjects();\n',
+    ],
+    [
+      '/** @param {string} effort the effort field of a route line, \'\' when it has none */\n',
+      '/** project name -> the project ids seen with it, to tell same-named projects apart */\n' +
+        '/** @type {Map<string, Set<string>>} */\n' +
+        'const projects = new Map();\n\n' +
+        '/**\n' +
+        " * Shows a project in el after `lead`, or nothing when there's none. The instance is only in the tooltip.\n" +
+        ' * @param {HTMLElement} el\n' +
+        " * @param {import('./project.js').Project | undefined} p\n" +
+        ' * @param {string} lead\n' +
+        ' */\n' +
+        'function setProject(el, p, lead) {\n' +
+        '  if (!p?.project) {\n' +
+        '    el.replaceChildren();\n' +
+        "    el.title = '';\n" +
+        '    delete el.dataset.project;\n' +
+        '    return;\n' +
+        '  }\n' +
+        '  el.dataset.project = JSON.stringify([p.project, p.projectId, lead]);\n' +
+        '  showProject(el, p, lead);\n' +
+        '  el.title = projectTip(p);\n' +
+        '}\n\n' +
+        '/**\n' +
+        ' * The lead and name, which may be cut short, then the id of a same-named project, which never is.\n' +
+        ' * @param {HTMLElement} el\n' +
+        " * @param {import('./project.js').Project} p\n" +
+        ' * @param {string} lead\n' +
+        ' */\n' +
+        'function showProject(el, p, lead) {\n' +
+        '  const { name, id } = projectParts(projects, p);\n' +
+        "  el.replaceChildren(h('span', 'proj-name', `${lead}${name}`), h('span', 'proj-id', id));\n" +
+        '}\n\n' +
+        '/**\n' +
+        " * @param {import('./project.js').Project | undefined} p\n" +
+        ' * @param {string} lead\n' +
+        ' */\n' +
+        'function projectEl(p, lead) {\n' +
+        "  const el = h('span', 'proj');\n" +
+        '  setProject(el, p, lead);\n' +
+        '  return el;\n' +
+        '}\n\n' +
+        '/** A name just got a second project id: the labels shown so far get the id too. */\n' +
+        'function relabelProjects() {\n' +
+        "  for (const el of document.querySelectorAll('.proj[data-project]')) {\n" +
+        '    if (!(el instanceof HTMLElement)) continue;\n' +
+        "    const [project, projectId, lead] = JSON.parse(el.dataset.project ?? '[]');\n" +
+        "    showProject(el, { project, projectId, instanceId: '' }, lead);\n" +
+        '  }\n' +
+        '}\n\n' +
+        '/** @param {string} effort the effort field of a route line, \'\' when it has none */\n',
+    ],
+    ["      model: '',\n      effort: '',\n      spend: 0,\n", "      model: '',\n      effort: '',\n      project: undefined,\n      spend: 0,\n"],
+    [
+      '  session.last = Math.max(session.last, route.ts);\n',
+      '  session.last = Math.max(session.last, route.ts);\n' +
+        '  // The lane names the project of its own session\'s latest request that named one.\n' +
+        '  if (route.project) session.project = { project: route.project, projectId: route.projectId, instanceId: route.instanceId };\n',
+    ],
+    [
+      "    h('span', 'client', clientName(rec.surface)),\n    h('span', 'arrow', '→'),\n",
+      "    h('span', 'client', clientName(rec.surface)),\n    projectEl(route, '/ project: '),\n    h('span', 'arrow', '→'),\n",
+    ],
+    [
+      "  main.append(h('span', 'kind', kindLabel(rec)));\n",
+      "  main.append(h('span', 'kind', kindLabel(rec)));\n" +
+        "  if (route.project) main.append(projectEl(route, `${clientName(rec.surface)} · `));\n",
+    ],
+    [
+      '/** @typedef {{ li: HTMLElement, tier: HTMLElement, model: HTMLElement, effort: HTMLElement, spend: HTMLElement,',
+      '/** @typedef {{ li: HTMLElement, tier: HTMLElement, model: HTMLElement, effort: HTMLElement, proj: HTMLElement, spend: HTMLElement,',
+    ],
+    [
+      "  head.append(dot, h('span', 'sess', short(session.id)), h('span', 'client', clientName(session.surface)), tier, model, effort, spend);\n",
+      "  const proj = h('span', 'proj');\n" +
+        "  head.append(dot, h('span', 'sess', short(session.id)), h('span', 'client', clientName(session.surface)), proj, tier, model, effort, spend);\n",
+    ],
+    ['  const lane = { li, tier, model, effort, spend, stairs, foot, turns: 0 };\n', '  const lane = { li, tier, model, effort, proj, spend, stairs, foot, turns: 0 };\n'],
+    ['  lane.spend.textContent = money(session.spend);\n', "  lane.spend.textContent = money(session.spend);\n  setProject(lane.proj, session.project, '· ');\n"],
   ],
   'ui/app.css': [
     [
@@ -452,6 +596,15 @@ const EDITS = {
       '.flow-svg.focused .edge.bypass {\n  opacity: 0.4;\n}\n\n' +
         "/* jev-router-route: the edges under the focused route's highlight. */\n" +
         '.flow-svg.focused .edge.on-path {\n  stroke-opacity: 0.45;\n  opacity: 1;\n}\n',
+    ],
+    [
+      '.hero-route .effort,\n.row .effort,\n.lane-head .effort {\n  font: 11px var(--mono);\n  color: var(--muted);\n  white-space: nowrap;\n}\n',
+      '.hero-route .effort,\n.row .effort,\n.lane-head .effort {\n  font: 11px var(--mono);\n  color: var(--muted);\n  white-space: nowrap;\n}\n\n' +
+        '/* jev-router-project: the project a request came from. */\n' +
+        '.hero-route .proj,\n.row .proj,\n.lane-head .proj {\n  display: inline-flex;\n  min-width: 0;\n  max-width: 36ch;\n  white-space: nowrap;\n}\n' +
+        '.proj .proj-name {\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n}\n' +
+        '.proj .proj-id {\n  flex: none;\n  white-space: pre;\n}\n' +
+        '.row .proj,\n.lane-head .proj {\n  font-size: 12px;\n  color: var(--muted);\n}\n',
     ],
   ],
 };
@@ -479,7 +632,7 @@ if (!pkgDir) fail('usage: node apply.mjs <package dir>');
 const pkg = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
 if (pkg.name !== '@ediri/jev-router' || pkg.version !== VERSION)
   fail(`expected @ediri/jev-router@${VERSION}, found ${pkg.name}@${pkg.version}; update the patch for the new version`);
-for (const added of ['src/effort.mjs', 'src/compat.mjs', 'src/models.mjs', 'ui/effort.js', 'ui/route.js'])
+for (const added of ['src/effort.mjs', 'src/compat.mjs', 'src/models.mjs', 'ui/effort.js', 'ui/route.js', 'src/project.mjs', 'ui/project.js'])
   if (existsSync(join(pkgDir, added))) fail(`${added} already exists: the package is already patched or not pristine`);
 
 /** @type {Record<string, string>} */
@@ -502,6 +655,8 @@ writeFileSync(join(pkgDir, 'src/compat.mjs'), readFileSync(join(here, 'compat.mj
 writeFileSync(join(pkgDir, 'src/models.mjs'), readFileSync(join(here, 'models.mjs'), 'utf8'));
 writeFileSync(join(pkgDir, 'ui/effort.js'), readFileSync(join(here, 'ui-effort.js'), 'utf8'));
 writeFileSync(join(pkgDir, 'ui/route.js'), readFileSync(join(here, 'ui-route.js'), 'utf8'));
+writeFileSync(join(pkgDir, 'src/project.mjs'), readFileSync(join(here, 'project.mjs'), 'utf8'));
+writeFileSync(join(pkgDir, 'ui/project.js'), readFileSync(join(here, 'ui-project.js'), 'utf8'));
 
 // The patched modules must still load.
 await import(pathToFileURL(join(pkgDir, 'src/config.mjs')).href);
@@ -509,4 +664,5 @@ await import(pathToFileURL(join(pkgDir, 'src/router.mjs')).href);
 await import(pathToFileURL(join(pkgDir, 'src/ui.mjs')).href);
 await import(pathToFileURL(join(pkgDir, 'ui/effort.js')).href);
 await import(pathToFileURL(join(pkgDir, 'ui/route.js')).href);
-console.log(`jev-router patch: ${VERSION} patched (chatgpt-path, effort, models, live-view effort and route, anthropic compat)`);
+await import(pathToFileURL(join(pkgDir, 'ui/project.js')).href);
+console.log(`jev-router patch: ${VERSION} patched (chatgpt-path, effort, models, live-view effort and route, anthropic compat, project)`);

@@ -741,6 +741,8 @@ O `.gitignore` fornecido pelo projeto cobre esses arquivos e o `.dockerignore` o
 
 Os wrappers `bin\codex.cmd` e `bin\claude.cmd` são gerados localmente pelo `install.ps1`, pois contêm caminhos específicos da máquina. Eles não são versionados.
 
+A identificação do projeto no Live View depende desses wrappers: chamar `claude.exe` ou `codex.exe` diretamente não envia metadata de projeto, e as requisições aparecem sem projeto. O `claude.cmd` também não injeta nada quando você passa `--settings` (ou `--settings=...`) como opção.
+
 O `install.ps1` restringe as permissões de `config\env` ao usuário atual, SYSTEM e Administradores (sem alterar o conteúdo). Se isso falhar, ele apenas emite um aviso.
 
 Isolamento dos containers:

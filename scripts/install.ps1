@@ -18,6 +18,10 @@ $CodexWrapper = Join-Path $BinDir "codex.cmd"
 $ClaudeWrapper = Join-Path $BinDir "claude.cmd"
 $PreflightFile = Join-Path $BinDir "preflight.ps1"
 
+# Mesmo endereco do ANTHROPIC_BASE_URL do settings.json global; o wrapper do
+# claude so acrescenta o prefixo /_jev/ do projeto.
+$RouterBaseUrl = "http://127.0.0.1:4000"
+
 $ClaudeDirectSettings = Join-Path $ModelLabDir "claude-direct-settings.json"
 
 Write-Host ""
@@ -195,23 +199,71 @@ function Write-CliWrapper(
     ).ToLowerInvariant()
 
     if ($extension -in @(".cmd", ".bat")) {
-        $launchLine = 'call "' + $RealPath + '" %*'
+        $launch = 'call "' + $RealPath + '"'
     }
     else {
-        $launchLine = '"' + $RealPath + '" %*'
+        $launch = '"' + $RealPath + '"'
     }
 
-    $content = @"
+    # Projeto e instancia para o Live View (bin\project.ps1). Nada e
+    # persistido e nenhum token passa pelo wrapper:
+    #   - claude: --settings inline so com ANTHROPIC_BASE_URL, com o prefixo
+    #     /_jev/<nome>/<id>/<instancia>; o token continua vindo do
+    #     settings.json global. Se o usuario ja passou --settings, nada e
+    #     injetado (projeto desconhecido);
+    #   - codex: variaveis deste processo + -c env_http_headers, que o Codex
+    #     omite quando a variavel nao existe.
+    # Se project.ps1 falhar, o CLI e chamado exatamente como antes.
+    if ($CliName -eq "claude") {
+        $tagged = $launch + ' --settings "{\"env\":{\"ANTHROPIC_BASE_URL\":\"' + $RouterBaseUrl + '/_jev/%JEV_PROJECT_NAME%/%JEV_PROJECT_ID%/%JEV_INSTANCE_ID%\"}}" %*'
+        $argsLine = 'set JEV_CLI_ARGS=%*'
+    }
+    else {
+        $tagged = $launch + " -c model_providers.jev.env_http_headers={'x-jev-project-name'='JEV_PROJECT_NAME','x-jev-project-id'='JEV_PROJECT_ID','x-jev-instance-id'='JEV_INSTANCE_ID'} %*"
+        $argsLine = 'set "JEV_CLI_ARGS="'
+    }
+
+    $content = @'
 @echo off
 setlocal
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0preflight.ps1" -Cli $CliName
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0preflight.ps1" -Cli __CLI__
 
-$launchLine
+set "JEV_PROJECT_NAME="
+set "JEV_PROJECT_ID="
+set "JEV_INSTANCE_ID="
+set "JEV_PROJECT_FLAG="
+__ARGS__
+for /f "usebackq tokens=1-4" %%a in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0project.ps1" -Cli __CLI__`) do (
+    set "JEV_PROJECT_NAME=%%a"
+    set "JEV_PROJECT_ID=%%b"
+    set "JEV_INSTANCE_ID=%%c"
+    set "JEV_PROJECT_FLAG=%%d"
+)
+set "JEV_CLI_ARGS="
 
+if defined JEV_PROJECT_FLAG goto plain
+if not defined JEV_INSTANCE_ID goto plain
+
+__TAGGED__
+goto done
+
+:plain
+set "JEV_PROJECT_NAME="
+set "JEV_PROJECT_ID="
+set "JEV_INSTANCE_ID="
+__PLAIN__
+
+:done
 set "JEV_EXIT_CODE=%ERRORLEVEL%"
 endlocal & exit /b %JEV_EXIT_CODE%
-"@
+'@
+
+    $content = $content.
+        Replace('__CLI__', $CliName).
+        Replace('__ARGS__', $argsLine).
+        Replace('__TAGGED__', $tagged).
+        Replace('__PLAIN__', $launch + ' %*')
 
     Set-Content `
         -Path $Destination `
@@ -315,6 +367,10 @@ if ($LASTEXITCODE -ne 0) {
 
 if (-not (Test-Path $PreflightFile)) {
     throw "Arquivo ausente: $PreflightFile"
+}
+
+if (-not (Test-Path (Join-Path $BinDir "project.ps1"))) {
+    throw "Arquivo ausente: $(Join-Path $BinDir "project.ps1")"
 }
 
 # ------------------------------------------------------------
