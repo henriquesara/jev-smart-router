@@ -4,7 +4,10 @@ RUN npm install -g @ediri/jev-router@1.6.0
 
 # Patch versionado em patches/jev-router-1.6.0 (ver apply.mjs):
 # - compatibilidade com Codex usando login ChatGPT (/v1/responses -> /backend-api/codex/responses);
-# - effort de raciocinio por target (o router define modelo + effort).
+# - effort de raciocinio por target (o router define modelo + effort);
+# - GET /v1/models repassa o catalogo real do upstream confiavel (nunca uma lista vazia);
+# - Live View mostra o effort de cada requisicao.
+# - Live View destaca a rota em foco sobre as proprias arestas do grafo.
 # O script confere versao, SHA-256 dos arquivos originais e cada trecho alterado;
 # qualquer divergencia falha o build.
 COPY patches/jev-router-1.6.0/ /tmp/jev-patch/

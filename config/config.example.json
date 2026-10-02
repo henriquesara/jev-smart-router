@@ -6,7 +6,8 @@
   "tiers": [
     "fast",
     "balanced",
-    "frontier"
+    "frontier",
+    "deep"
   ],
   "defaultTier": "balanced",
   "policy": {
@@ -16,6 +17,7 @@
       "balanced": 0.6,
       "frontier": 0.3
     },
+    "escalationCeiling": "frontier",
     "sensitiveOverride": 0.7,
     "claimGuard": 0.5,
     "maxProvisional": 3,
@@ -83,7 +85,7 @@
         "not_for": "Explicit proofs, optimization that must be justified, or decisions between conflicting objectives"
       },
       "deep": {
-        "tier": "frontier",
+        "tier": "deep",
         "what": "Work that needs extended deliberation: a proof or refutation, optimization with justification, or an architecture or migration decision that weighs conflicting trade-offs under uncertainty",
         "examples": [
           "design the zero-downtime migration and its rollback",
@@ -139,6 +141,15 @@
         "clientAuth": true,
         "trusted": true
       },
+      "deep": {
+        "url": "https://api.anthropic.com",
+        "model": "claude-opus-5-5",
+        "effort": "xhigh",
+        "auth": "x-api-key",
+        "keyEnv": "ANTHROPIC_API_KEY",
+        "clientAuth": true,
+        "trusted": true
+      },
       "trusted": {
         "url": "https://api.anthropic.com",
         "model": "claude-sonnet-5",
@@ -170,6 +181,14 @@
         "url": "https://chatgpt.com/backend-api/codex",
         "model": "gpt-6-astra",
         "effort": "high",
+        "auth": "bearer",
+        "clientAuth": true,
+        "trusted": true
+      },
+      "deep": {
+        "url": "https://chatgpt.com/backend-api/codex",
+        "model": "gpt-6-astra",
+        "effort": "xhigh",
         "auth": "bearer",
         "clientAuth": true,
         "trusted": true

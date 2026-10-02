@@ -1,6 +1,7 @@
-// Effort per tier in the patched jev-router (patches/jev-router-1.6.0).
+// Effort per tier, GET /v1/models, the deep tier and the live view's route highlight in the patched
+// jev-router (patches/jev-router-1.6.0).
 //
-// Unit tests of effort.mjs and of the patch script run anywhere:
+// Unit tests of effort.mjs, models.mjs, ui-effort.js, ui-route.js and of the patch script run anywhere:
 //   node --test tests/router-effort.test.mjs
 // The router tests need the patched package and run in the image (no network, no real upstream):
 //   docker run --rm --network none -v "${PWD}/tests:/repo/tests:ro" -v "${PWD}/patches:/repo/patches:ro" \
@@ -16,6 +17,18 @@ import { describe, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { applyEffort, EFFORTS, effortFor, effortProblems, isEffort, supportsEffort } from '../patches/jev-router-1.6.0/effort.mjs';
+import { CATALOG_HEADERS, MAX_CATALOG_BYTES, catalogBody, catalogPath, catalogTarget } from '../patches/jev-router-1.6.0/models.mjs';
+import {
+  countEffort,
+  effortBreakdown,
+  effortOf,
+  effortText,
+  effortTip,
+  modelEffortLine,
+  NO_EFFORT,
+  spendEffort,
+} from '../patches/jev-router-1.6.0/ui-effort.js';
+import { chainEdges, edgeId, graphLinks, routeChain } from '../patches/jev-router-1.6.0/ui-route.js';
 
 const APPLY = fileURLToPath(new URL('../patches/jev-router-1.6.0/apply.mjs', import.meta.url));
 const EXAMPLE = JSON.parse(readFileSync(new URL('../config/config.example.json', import.meta.url), 'utf8'));
@@ -105,6 +118,311 @@ describe('effort.mjs', () => {
   });
 });
 
+/** A catalog in the shape Codex reads (ModelsResponse): only `models`, each with at least a slug. Test data. */
+const CATALOG = {
+  models: [
+    { slug: 'test-model-a', display_name: 'A', supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }], context_window: 1000 },
+    { slug: 'test-model-b', display_name: 'B', supported_reasoning_levels: [{ effort: 'medium' }], context_window: 2000 },
+  ],
+};
+
+describe('models.mjs', () => {
+  test('the catalog target: the default tier, else trusted; only trusted, client login, no router key', () => {
+    const t = EXAMPLE.surfaces.openai;
+    assert.equal(catalogTarget(t, EXAMPLE.defaultTier), t.balanced);
+    assert.equal(catalogTarget(t, 'nope'), t.trusted);
+    assert.equal(catalogTarget(t, undefined), t.trusted);
+    const ok = { url: 'https://up.example', trusted: true, clientAuth: true };
+    assert.equal(catalogTarget({ balanced: ok }, 'balanced'), ok);
+    for (const bad of [
+      { ...ok, trusted: false },
+      { ...ok, clientAuth: false },
+      { ...ok, keyEnv: 'SOME_KEY' },
+      { ...ok, url: undefined },
+      { ...ok, trusted: 'true' },
+    ])
+      assert.equal(catalogTarget({ balanced: bad }, 'balanced'), undefined, JSON.stringify(bad));
+    assert.equal(catalogTarget(undefined, 'balanced'), undefined);
+    assert.equal(catalogTarget({}, 'balanced'), undefined);
+  });
+
+  test('the catalog path: /v1 dropped for the ChatGPT backend, query kept', () => {
+    assert.equal(catalogPath('https://chatgpt.com/backend-api/codex', '/v1/models?client_version=0.159.3'), '/models?client_version=0.159.3');
+    assert.equal(catalogPath('https://api.example', '/v1/models?client_version=1'), '/v1/models?client_version=1');
+  });
+
+  test('the catalog body: relayed as received only when it holds models', () => {
+    const text = JSON.stringify(CATALOG);
+    assert.equal(catalogBody(200, text), text, 'verbatim');
+    for (const [status, bad, why] of [
+      [200, '{"models":[]}', 'empty: would empty the Codex cache'],
+      [200, '{"object":"list","data":[{"id":"x"}],"models":[]}', 'the old router answer'],
+      [200, '{"data":[{"id":"x"}]}', 'OpenAI list only'],
+      [200, '{"models":[{"slug":"a"},{"name":"b"}]}', 'an entry without slug'],
+      [200, '{"models":[{"slug":""}]}', 'empty slug'],
+      [200, '{"models":[null]}', 'null entry'],
+      [200, '{"models":{"slug":"a"}}', 'not an array'],
+      [200, '[{"slug":"a"}]', 'not an object'],
+      [200, 'null', 'null'],
+      [200, '<html>', 'not JSON'],
+      [200, '', 'empty'],
+      [304, text, 'not modified'],
+      [401, text, 'unauthorized'],
+      [500, text, 'server error'],
+    ])
+      assert.equal(catalogBody(/** @type {number} */ (status), /** @type {string} */ (bad)), undefined, /** @type {string} */ (why));
+    const huge = JSON.stringify({ models: [{ slug: 'a', pad: 'x'.repeat(MAX_CATALOG_BYTES) }] });
+    assert.equal(catalogBody(200, huge), undefined, 'over the size cap');
+  });
+
+  test('only ETag headers are relayed', () => {
+    assert.deepEqual(CATALOG_HEADERS, ['etag', 'x-models-etag']);
+  });
+});
+
+describe('live view effort (ui-effort.js)', () => {
+  const money = (/** @type {number} */ usd) => `$${usd.toFixed(3)}`;
+
+  test('the effort comes only from the line\'s own effort field', () => {
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max', 'minimal', 'none']) assert.equal(effortOf({ effort }), effort);
+    assert.equal(effortOf({}), '', 'an old line without effort');
+    assert.equal(effortOf({ tier: 'deep', model: 'gpt-6-astra' }), '', 'never from the tier or the model');
+    for (const bad of [null, 7, '', 'LOW', 'x'.repeat(17), '<b>', 'low high', { effort: 'low' }, ['low']])
+      assert.equal(effortOf({ effort: bad }), '', JSON.stringify(bad));
+  });
+
+  test('a missing effort shows a dash, never a value', () => {
+    assert.equal(NO_EFFORT, '—');
+    assert.equal(effortText(''), '—');
+    assert.equal(effortText('xhigh'), 'xhigh');
+    assert.match(effortTip(''), /No reasoning effort from the router/);
+    assert.match(effortTip('low'), /: low$/);
+  });
+
+  test('the model of the request in focus shows that request\'s effort', () => {
+    const efforts = new Map();
+    countEffort(efforts, 'low');
+    assert.equal(modelEffortLine(efforts, 'low'), 'effort: low');
+    assert.equal(modelEffortLine(efforts, ''), 'effort: —', 'focused request without effort');
+    assert.equal(modelEffortLine(new Map(), undefined), '', 'a model nothing ran on');
+    assert.equal(modelEffortLine(undefined, undefined), '');
+  });
+
+  test('fast / gpt-6-luna / low and deep / gpt-6-astra / xhigh, as the active path reads', () => {
+    /** @type {Map<string, Map<string, any>>} */
+    const models = new Map();
+    const route = (/** @type {string} */ model, /** @type {string} */ effort) => {
+      if (!models.has(model)) models.set(model, new Map());
+      countEffort(/** @type {Map<string, any>} */ (models.get(model)), effortOf({ effort }));
+      return { model, effort: effortOf({ effort }) };
+    };
+    const line = (/** @type {string} */ model, /** @type {{ model: string, effort: string }} */ focus) =>
+      modelEffortLine(models.get(model), focus.model === model ? focus.effort : undefined);
+
+    let focus = route('gpt-6-luna', 'low'); // fast
+    assert.equal(line('gpt-6-luna', focus), 'effort: low');
+    focus = route('gpt-6-astra', 'xhigh'); // deep
+    assert.equal(line('gpt-6-astra', focus), 'effort: xhigh');
+    assert.equal(line('gpt-6-luna', focus), 'effort: low', 'the other model lists what it ran at');
+
+    // Same model, another effort (frontier: astra at high): both are counted apart, the focus is exact.
+    focus = route('gpt-6-astra', 'high');
+    assert.equal(line('gpt-6-astra', focus), 'effort: high');
+    assert.deepEqual([...(models.get('gpt-6-astra')?.entries() ?? [])], [
+      ['xhigh', { count: 1, spend: 0 }],
+      ['high', { count: 1, spend: 0 }],
+    ]);
+    // Model change, effort kept: sol at high.
+    focus = route('gpt-6.1-sol', 'high');
+    assert.equal(line('gpt-6.1-sol', focus), 'effort: high');
+    assert.equal(line('gpt-6-astra', focus), 'effort: high/xhigh', 'unfocused: the efforts seen, in order');
+    // An old line without effort on astra, then a third level: a count, not a guess.
+    focus = route('gpt-6-astra', undefined);
+    assert.equal(line('gpt-6-astra', focus), 'effort: —');
+    focus = route('gpt-6-astra', 'medium');
+    focus = route('gpt-6-luna', 'low');
+    assert.equal(line('gpt-6-astra', focus), 'effort: 4 levels');
+  });
+
+  test('spend per effort, and the breakdown of a model in its tooltip', () => {
+    const efforts = new Map();
+    countEffort(efforts, 'xhigh');
+    countEffort(efforts, 'xhigh');
+    countEffort(efforts, 'low');
+    countEffort(efforts, '');
+    spendEffort(efforts, 'xhigh', 0.5);
+    spendEffort(efforts, 'low', 0.01);
+    assert.equal(effortBreakdown(efforts, money), 'effort low: 1 req, $0.010 · effort xhigh: 2 req, $0.500 · effort —: 1 req, $0.000');
+    assert.equal(effortBreakdown(new Map(), money), '');
+  });
+});
+
+describe('live view route highlight (ui-route.js)', () => {
+  const options = Object.fromEntries(Object.entries(EXAMPLE.jev.options).map(([o, v]) => [o, v.tier]));
+  const tiers = [...EXAMPLE.tiers, 'side'];
+
+  /**
+   * The cards and edges of the flow for the example config, column by column as app.js lays them out.
+   * @param {'full' | 'medium' | 'compact'} mode
+   * @param {string[]} [extra] more tier>model links, as when the config's model for a tier changes
+   */
+  function flow(mode, extra = []) {
+    const surfaces = ['anthropic', 'openai'];
+    /** @type {Array<{ id: string, kind: string, key: string }>} */
+    const nodes = [];
+    const add = (/** @type {string} */ kind, /** @type {string} */ prefix, /** @type {string} */ key) => nodes.push({ id: `${prefix}${key}`, kind, key });
+    if (mode === 'full') for (const s of surfaces) add('client', 'client:', s);
+    if (mode !== 'compact') add('router', '', 'router');
+    for (const o of Object.keys(options)) add('option', 'opt:', o);
+    for (const t of tiers) add('tier', 'tier:', t);
+    const links = new Set();
+    for (const s of surfaces)
+      for (const t of tiers) {
+        const model = EXAMPLE.surfaces[s][t]?.model;
+        if (!model) continue;
+        if (!nodes.some((n) => n.id === `model:${model}`)) add('model', 'model:', model);
+        links.add(`${t}>${model}`);
+      }
+    for (const link of extra) {
+      const model = link.split('>')[1];
+      if (!nodes.some((n) => n.id === `model:${model}`)) add('model', 'model:', model);
+      links.add(link);
+    }
+    const source = mode === 'compact' ? 'entry' : 'router';
+    const all = graphLinks(nodes, { source, optionTier: (o) => options[o], bypass: true, surfaces, links });
+    const edges = new Map(all.map((l) => [edgeId(l.from, l.to), l]));
+    const ids = new Set(nodes.map((n) => n.id));
+    return { edges, has: (/** @type {string} */ id) => ids.has(id) };
+  }
+
+  /**
+   * @param {string} tier
+   * @param {string} model
+   * @param {string} [choice] the Jev category, when this request asked Jev
+   */
+  const route = (tier, model, choice) => ({ tier, model, ...(choice ? { jev: { ok: true, choice } } : {}) });
+
+  /**
+   * The edge ids the highlight draws for a request, after checking that each is an edge of the graph.
+   * @param {ReturnType<typeof flow>} g
+   * @param {Parameters<typeof routeChain>[0]} opts
+   */
+  function highlight(g, opts) {
+    const steps = chainEdges(routeChain(opts), g.edges);
+    for (const s of steps) assert.ok(s.drawn, `${s.id} is an edge of the graph`);
+    return steps.map((s) => s.id);
+  }
+
+  const full = flow('full');
+  const claude = { mode: 'full', surface: 'anthropic', has: full.has };
+
+  test('each Jev category goes through its own tier, over the graph edges', () => {
+    const cases = [
+      ['mechanical', 'fast', 'claude-haiku-4-5'],
+      ['routine', 'balanced', 'claude-sonnet-5'],
+      ['complex', 'frontier', 'claude-opus-5-5'],
+      ['deep', 'deep', 'claude-opus-5-5'],
+    ];
+    for (const [choice, tier, model] of cases) {
+      assert.deepEqual(highlight(full, { ...claude, route: route(tier, model, choice) }), [
+        'client:anthropic>router',
+        `router>opt:${choice}`,
+        `opt:${choice}>tier:${tier}`,
+        `tier:${tier}>model:${model}`,
+      ]);
+      assert.equal(full.edges.get(`opt:${choice}>tier:${tier}`)?.kind, 'map');
+    }
+  });
+
+  test('a tool-loop step goes through the category of the prompt that set its tier, not the bypass', () => {
+    const prompt = route('frontier', 'claude-opus-5-5', 'complex');
+    const sticky = route('frontier', 'claude-opus-5-5');
+    const ids = highlight(full, { ...claude, route: sticky, decision: prompt });
+    assert.deepEqual(ids, ['client:anthropic>router', 'router>opt:complex', 'opt:complex>tier:frontier', 'tier:frontier>model:claude-opus-5-5']);
+    assert.ok(!ids.some((id) => full.edges.get(id)?.kind === 'bypass'));
+  });
+
+  test('requests no prompt decided take the bypass edge, past the categories', () => {
+    const side = highlight(full, { ...claude, route: route('side', 'claude-haiku-4-5') });
+    assert.deepEqual(side, ['client:anthropic>router', 'router>tier:side', 'tier:side>model:claude-haiku-4-5']);
+    assert.equal(full.edges.get('router>tier:side')?.kind, 'bypass');
+    const tagged = highlight(full, { ...claude, route: route('frontier', 'claude-opus-5-5') });
+    assert.deepEqual(tagged, ['client:anthropic>router', 'router>tier:frontier', 'tier:frontier>model:claude-opus-5-5']);
+  });
+
+  test('a model change moves only the last edge; a client change only the first', () => {
+    const swapped = flow('full', ['frontier>claude-sonnet-5']);
+    const a = highlight(swapped, { ...claude, has: swapped.has, route: route('frontier', 'claude-opus-5-5', 'complex') });
+    const b = highlight(swapped, { ...claude, has: swapped.has, route: route('frontier', 'claude-sonnet-5', 'complex') });
+    assert.equal(a.at(-1), 'tier:frontier>model:claude-opus-5-5');
+    assert.deepEqual(a.slice(0, -1), b.slice(0, -1));
+    assert.equal(b.at(-1), 'tier:frontier>model:claude-sonnet-5');
+    const codex = highlight(full, { mode: 'full', surface: 'openai', has: full.has, route: route('fast', 'gpt-6-luna', 'mechanical') });
+    const claudeFast = highlight(full, { ...claude, route: route('fast', 'gpt-6-luna', 'mechanical') });
+    assert.equal(codex[0], 'client:openai>router');
+    assert.equal(claudeFast[0], 'client:anthropic>router');
+    assert.deepEqual(codex.slice(1), claudeFast.slice(1));
+  });
+
+  test('the model card is the one the request ran on, whatever its effort', () => {
+    // Effort is a line inside the model card, not a card of its own: astra at high and at xhigh
+    // end on the same edge.
+    const g = flow('full');
+    const codex = { mode: 'full', surface: 'openai', has: g.has };
+    const high = highlight(g, { ...codex, route: { ...route('frontier', 'gpt-6-astra', 'complex'), effort: 'high' } });
+    const xhigh = highlight(g, { ...codex, route: { ...route('deep', 'gpt-6-astra', 'deep'), effort: 'xhigh' } });
+    assert.equal(high.at(-1), 'tier:frontier>model:gpt-6-astra');
+    assert.equal(xhigh.at(-1), 'tier:deep>model:gpt-6-astra');
+  });
+
+  test('narrower layouts start at the router, or at the entry when there is no router card', () => {
+    const medium = flow('medium');
+    assert.deepEqual(highlight(medium, { mode: 'medium', surface: 'anthropic', has: medium.has, route: route('balanced', 'claude-sonnet-5', 'routine') }), [
+      'router>opt:routine',
+      'opt:routine>tier:balanced',
+      'tier:balanced>model:claude-sonnet-5',
+    ]);
+    const compact = flow('compact');
+    assert.deepEqual(highlight(compact, { mode: 'compact', surface: 'anthropic', has: compact.has, route: route('fast', 'claude-haiku-4-5', 'mechanical') }), [
+      'entry>opt:mechanical',
+      'opt:mechanical>tier:fast',
+      'tier:fast>model:claude-haiku-4-5',
+    ]);
+  });
+
+  test('a category whose tier the router overrode is not an edge of the graph, and says so', () => {
+    // Ratchet: Jev answered routine (balanced), the session stayed on frontier.
+    const steps = chainEdges(routeChain({ ...claude, route: route('frontier', 'claude-opus-5-5', 'routine') }), full.edges);
+    assert.deepEqual(
+      steps.map((s) => [s.id, s.drawn]),
+      [
+        ['client:anthropic>router', true],
+        ['router>opt:routine', true],
+        ['opt:routine>tier:frontier', false],
+        ['tier:frontier>model:claude-opus-5-5', true],
+      ],
+    );
+  });
+
+  test('cards missing from the graph are left out of the chain', () => {
+    assert.deepEqual(routeChain({ ...claude, route: route('frontier', 'claude-unknown', 'complex') }), [
+      'client:anthropic',
+      'router',
+      'opt:complex',
+      'tier:frontier',
+    ]);
+  });
+
+  test('the edges keep the order and kinds the original graph drew', () => {
+    const kinds = [...full.edges.values()].map((l) => `${l.kind || 'edge'}:${l.from}>${l.to}`);
+    assert.deepEqual(kinds.slice(0, 3), ['edge:router>opt:mechanical', 'map:opt:mechanical>tier:fast', 'edge:router>opt:routine']);
+    assert.ok(kinds.includes('bypass:router>tier:deep'));
+    assert.ok(kinds.indexOf('edge:client:anthropic>router') > kinds.indexOf('bypass:router>tier:side'));
+    assert.ok(!kinds.some((k) => k.startsWith('bypass:') && k.includes('opt:')));
+    assert.ok(!graphLinks([{ id: 'tier:fast', kind: 'tier', key: 'fast' }], { source: 'entry', optionTier: () => undefined, bypass: false, surfaces: [], links: [] }).length);
+  });
+});
+
 describe('apply.mjs refuses anything but the published 1.6.0 files', () => {
   /** @param {Record<string, string>} files */
   function fakePackage(files) {
@@ -133,7 +451,7 @@ describe('apply.mjs refuses anything but the published 1.6.0 files', () => {
     });
     const r = run([dir]);
     const after = readFileSync(join(dir, 'src/router.mjs'), 'utf8');
-    const added = existsSync(join(dir, 'src/effort.mjs'));
+    const added = existsSync(join(dir, 'src/effort.mjs')) || existsSync(join(dir, 'src/models.mjs'));
     rmSync(dir, { recursive: true });
     assert.equal(r.status, 1);
     assert.match(r.stderr, /src\/router\.mjs is not the published 1\.6\.0 file \(SHA-256 mismatch\)/);
@@ -152,12 +470,49 @@ describe('apply.mjs refuses anything but the published 1.6.0 files', () => {
     const router = readFileSync(join(PKG, 'src/router.mjs'), 'utf8');
     assert.ok(router.includes('outgoing = applyEffort(outgoing, surface, effort);'));
     assert.ok(router.includes("req.url.replace(/^\\/v1/, '')"), 'ChatGPT path patch kept');
+    assert.ok(router.includes('const target = catalogTarget(cfg.surfaces.openai, cfg.defaultTier);'), 'models patch');
+    assert.ok(!router.includes('modelList'), 'no empty catalog of its own');
+    assert.ok(existsSync(join(PKG, 'src/models.mjs')));
+    const app = readFileSync(join(PKG, 'ui/app.js'), 'utf8');
+    assert.ok(app.startsWith("// jev-router live view.") && app.includes("from './effort.js';"), 'live view patch');
+    assert.ok(app.includes('effort: effortOf(raw),'));
+    assert.equal(readFileSync(join(PKG, 'ui/effort.js'), 'utf8'), readFileSync(new URL('../patches/jev-router-1.6.0/ui-effort.js', import.meta.url), 'utf8'));
+    assert.ok(readFileSync(join(PKG, 'src/ui.mjs'), 'utf8').includes("'/effort.js': 'effort.js',"));
+    assert.ok(readFileSync(join(PKG, 'ui/app.css'), 'utf8').includes('.lane-head .effort'));
+    assert.equal(readFileSync(join(PKG, 'ui/route.js'), 'utf8'), readFileSync(new URL('../patches/jev-router-1.6.0/ui-route.js', import.meta.url), 'utf8'));
+    assert.ok(readFileSync(join(PKG, 'src/ui.mjs'), 'utf8').includes("'/route.js': 'route.js',"));
+    assert.ok(app.includes("from './route.js';") && !app.includes('function jevEdges'), 'route highlight patch');
+    assert.ok(readFileSync(join(PKG, 'ui/app.css'), 'utf8').includes('.flow-svg.focused .edge.on-path'));
+  });
+
+  test('the live view serves its effort and route modules next to app.js, under the same CSP', inImage, async () => {
+    const { createUiServer } = await import(pathToFileURL(join(PKG, 'src/ui.mjs')).href);
+    const ui = createUiServer({ heartbeatMs: 60000 });
+    const base = await ui.listen(0, '127.0.0.1');
+    try {
+      const page = await fetch(new URL('/', base));
+      assert.equal(page.status, 200);
+      const csp = page.headers.get('content-security-policy') ?? '';
+      assert.match(csp, /script-src 'self'/);
+      await page.text();
+      for (const path of ['/app.js', '/effort.js', '/route.js']) {
+        const res = await fetch(new URL(path, base));
+        assert.equal(res.status, 200, path);
+        assert.match(res.headers.get('content-type') ?? '', /^text\/javascript/, path);
+        const text = await res.text();
+        if (path === '/effort.js') assert.ok(text.includes('export function effortOf'));
+        if (path === '/route.js') assert.ok(text.includes('export function chainEdges'));
+      }
+    } finally {
+      await ui.close();
+    }
   });
 });
 
 describe('router: tier -> model + effort', inImage, () => {
   /** @type {any} */ let createRouter;
   /** @type {any} */ let validateConfig;
+  /** @type {any} */ let applyPolicy;
 
   /** A local upstream that records what the router sends. */
   async function fakeUpstream() {
@@ -240,6 +595,7 @@ describe('router: tier -> model + effort', inImage, () => {
   test.before(async () => {
     ({ createRouter } = await import(pathToFileURL(join(PKG, 'src/router.mjs')).href));
     ({ validateConfig } = await import(pathToFileURL(join(PKG, 'src/config.mjs')).href));
+    ({ applyPolicy } = await import(pathToFileURL(join(PKG, 'src/jev.mjs')).href));
     upstream = await fakeUpstream();
   });
   test.after(() => upstream.close());
@@ -248,6 +604,7 @@ describe('router: tier -> model + effort', inImage, () => {
     ['fast', 'gpt-6-luna', 'medium', 'low'],
     ['balanced', 'gpt-6.1-sol', 'xhigh', 'medium'],
     ['frontier', 'gpt-6-astra', 'low', 'high'],
+    ['deep', 'gpt-6-astra', 'medium', 'xhigh'],
   ]) {
     test(`openai ${tier}: model ${model}, client ${client} -> reasoning.effort ${effort}`, async () => {
       const { sent, path, res, logs } = await route(upstream, exampleConfig(upstream.url), {
@@ -299,6 +656,7 @@ describe('router: tier -> model + effort', inImage, () => {
   for (const [tier, model, client, effort] of [
     ['balanced', 'claude-sonnet-5', 'high', 'medium'],
     ['frontier', 'claude-opus-5-5', 'max', 'high'],
+    ['deep', 'claude-opus-5-5', 'low', 'xhigh'],
   ]) {
     test(`anthropic ${tier}: model ${model}, client ${client} -> output_config.effort ${effort}`, async () => {
       const { sent, path, res } = await route(upstream, exampleConfig(upstream.url), {
@@ -360,5 +718,215 @@ describe('router: tier -> model + effort', inImage, () => {
     ];
     for (const edit of bad) assert.throws(() => exampleConfig('http://127.0.0.1:1', edit), /Invalid router config:[\s\S]*\.effort/);
     assert.doesNotThrow(() => exampleConfig('http://127.0.0.1:1'));
+  });
+
+  test('deep: tiers, options, escalation ceiling and targets of the example config', () => {
+    const cfg = exampleConfig('http://127.0.0.1:1');
+    assert.deepEqual(cfg.tiers, ['fast', 'balanced', 'frontier', 'deep']);
+    assert.equal(cfg.policy.escalationCeiling, 'frontier');
+    assert.equal(cfg.jev.options.complex.tier, 'frontier');
+    assert.equal(cfg.jev.options.deep.tier, 'deep');
+    assert.equal(cfg.surfaces.openai.deep.effort, 'xhigh');
+    assert.equal(cfg.surfaces.anthropic.deep.effort, 'xhigh');
+    assert.equal(cfg.modelPins.opus, 'frontier', 'no client model is pinned to deep');
+  });
+
+  test('deep: policy with the example config', () => {
+    const cfg = exampleConfig('http://127.0.0.1:1');
+    const decide = (/** @type {Record<string, number>} */ probabilities, sensitive = 0) =>
+      applyPolicy({ answer: { probabilities, sensitive }, tiers: cfg.tiers, options: cfg.jev.options, policy: cfg.policy, reference: cfg.defaultTier })
+        .tier;
+    assert.equal(decide({ deep: 0.7, complex: 0.3 }), 'deep', 'deep as the top answer');
+    assert.equal(decide({ deep: 0.35, complex: 0.65 }), 'frontier', 'complex stays frontier');
+    assert.equal(decide({ mechanical: 0.5, deep: 0.45, routine: 0.05 }), 'frontier', 'unsure between fast and deep: frontier, not deep');
+    assert.equal(decide({ routine: 0.55, deep: 0.45 }), 'frontier', 'unsure between balanced and deep: frontier, not deep');
+    assert.equal(decide({ mechanical: 1 }, 0.9), 'deep', 'sensitiveOverride sends to the top tier, which is now deep');
+  });
+
+  describe('GET /v1/models', () => {
+    /**
+     * @param {any} cfg
+     * @param {Record<string, string>} env
+     * @param {(base: string, logs: any[]) => Promise<void>} body
+     */
+    async function withRouter(cfg, env, body) {
+      /** @type {any[]} */
+      const logs = [];
+      const router = createRouter(cfg, { env, log: (/** @type {any} */ e) => logs.push(e) });
+      await new Promise((resolve) => router.listen(0, '127.0.0.1', () => resolve(undefined)));
+      try {
+        await body(`http://127.0.0.1:${router.address().port}`, logs);
+      } finally {
+        router.close();
+      }
+    }
+
+    /**
+     * A catalog upstream: answers GETs with `reply`, records each request's path and headers.
+     * @param {(path: string) => { status: number, body: string, headers?: Record<string, string> }} reply
+     */
+    async function catalogUpstream(reply) {
+      /** @type {Array<{ method: string, path: string, headers: import('node:http').IncomingHttpHeaders }>} */
+      const seen = [];
+      const server = http.createServer((req, res) => {
+        req.resume();
+        seen.push({ method: req.method ?? '', path: req.url ?? '', headers: req.headers });
+        const r = reply(req.url ?? '');
+        res.writeHead(r.status, { 'content-type': 'application/json', ...r.headers });
+        res.end(r.body);
+      });
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+      const { port } = /** @type {import('node:net').AddressInfo} */ (server.address());
+      return { url: `http://127.0.0.1:${port}`, seen, close: () => server.close() };
+    }
+
+    const catalogText = JSON.stringify(CATALOG);
+    const login = { authorization: 'Bearer client-login-only', 'chatgpt-account-id': 'acct-test' };
+
+    test('200: the upstream catalog verbatim, with the client\'s query, login and ETag', async () => {
+      const up = await catalogUpstream(() => ({ status: 200, body: catalogText, headers: { etag: '"v1"', 'set-cookie': 'a=b', 'x-other': '1' } }));
+      try {
+        await withRouter(exampleConfig(up.url), {}, async (base, logs) => {
+          for (const path of ['/v1/models', '/v1/models?client_version=0.159.3']) {
+            const res = await fetch(base + path, { headers: login });
+            assert.equal(res.status, 200, path);
+            assert.match(res.headers.get('content-type') ?? '', /^application\/json/);
+            assert.equal(res.headers.get('etag'), '"v1"');
+            assert.equal(res.headers.get('set-cookie'), null, 'no upstream cookie');
+            assert.equal(res.headers.get('x-other'), null);
+            const text = await res.text();
+            assert.equal(text, catalogText, 'verbatim: the real schema, nothing added');
+            const body = JSON.parse(text);
+            assert.deepEqual(Object.keys(body), ['models']);
+            assert.ok(body.models.length > 0, 'never an empty catalog');
+            const slugs = body.models.map((/** @type {any} */ m) => m.slug);
+            assert.deepEqual(slugs, ['test-model-a', 'test-model-b']);
+            assert.equal(new Set(slugs).size, slugs.length, 'no duplicates');
+            for (const leak of [up.url, '127.0.0.1', 'client-login-only', 'acct-test', 'keyEnv', 'x-jev', 'xhigh', 'bearer'])
+              assert.ok(!text.includes(leak), leak);
+          }
+          assert.deepEqual(
+            up.seen.map((s) => `${s.method} ${s.path}`),
+            ['GET /v1/models', 'GET /v1/models?client_version=0.159.3'],
+          );
+          for (const s of up.seen) {
+            assert.equal(s.headers.authorization, 'Bearer client-login-only', 'the client login, to the trusted target only');
+            assert.equal(s.headers['chatgpt-account-id'], 'acct-test');
+          }
+          const entries = logs.filter((e) => e.event === 'models');
+          assert.equal(entries.length, 2);
+          for (const e of entries) {
+            assert.deepEqual(Object.keys(e).sort(), ['event', 'relayed', 'status', 'ts', 'upstream']);
+            assert.equal(e.relayed, true);
+            assert.ok(!JSON.stringify(e).includes('client-login-only'));
+          }
+        });
+      } finally {
+        up.close();
+      }
+    });
+
+    test('the ChatGPT backend gets /models, like /responses', () => {
+      assert.equal(catalogPath('https://chatgpt.com/backend-api/codex', '/v1/models?client_version=0.159.3'), '/models?client_version=0.159.3');
+    });
+
+    test('regression: anything but a catalog with models is a 404, never an empty list', async () => {
+      for (const [status, body] of [
+        [200, '{"models":[]}'],
+        [200, '{"object":"list","data":[{"id":"gpt-6-luna"}],"models":[]}'],
+        [200, '{"data":[{"id":"gpt-6-luna"}]}'],
+        [200, 'not json'],
+        [401, '{"error":"unauthorized"}'],
+        [500, catalogText],
+      ]) {
+        const up = await catalogUpstream(() => ({ status: /** @type {number} */ (status), body: /** @type {string} */ (body) }));
+        try {
+          await withRouter(exampleConfig(up.url), {}, async (base, logs) => {
+            const res = await fetch(`${base}/v1/models?client_version=0.159.3`, { headers: login });
+            assert.equal(res.status, 404, `${status} ${body}`);
+            const text = await res.text();
+            assert.ok(!text.includes('"models"'), 'no catalog field at all');
+            assert.ok(!text.includes('client-login-only'));
+            assert.equal(logs.find((e) => e.event === 'models')?.relayed, false);
+          });
+        } finally {
+          up.close();
+        }
+      }
+      // An unreachable upstream, too.
+      await withRouter(exampleConfig('http://127.0.0.1:1'), {}, async (base) => {
+        assert.equal((await fetch(`${base}/v1/models`, { headers: login })).status, 404, 'unreachable');
+      });
+    });
+
+    test('no catalog target (an untrusted or keyed default tier): 404 and no upstream call', async () => {
+      const up = await catalogUpstream(() => ({ status: 200, body: catalogText }));
+      try {
+        const variants = [
+          (/** @type {any} */ c) => {
+            c.surfaces.openai.balanced.trusted = false;
+            c.surfaces.openai.trusted.keyEnv = 'TEST_ONLY_KEY';
+          },
+          (/** @type {any} */ c) => {
+            c.surfaces.openai.balanced.keyEnv = 'TEST_ONLY_KEY';
+            c.surfaces.openai.trusted.keyEnv = 'TEST_ONLY_KEY';
+          },
+        ];
+        for (const edit of variants) {
+          await withRouter(exampleConfig(up.url, edit), { TEST_ONLY_KEY: 'test-only-key' }, async (base) => {
+            assert.equal((await fetch(`${base}/v1/models`, { headers: login })).status, 404);
+          });
+        }
+        assert.equal(up.seen.length, 0, 'the login never left for an untrusted upstream');
+      } finally {
+        up.close();
+      }
+    });
+
+    test('the router token is required when set, as on the API routes, and never forwarded', async () => {
+      const token = 'test-token-0123456789';
+      const up = await catalogUpstream(() => ({ status: 200, body: catalogText }));
+      try {
+        await withRouter(exampleConfig(up.url), { JEV_ROUTER_TOKEN: token }, async (base) => {
+          for (const headers of [{}, { 'x-jev-router-token': 'wrong' }]) {
+            const res = await fetch(`${base}/v1/models`, { headers });
+            assert.equal(res.status, 401);
+            const body = await res.json();
+            assert.equal(body.error.type, 'authentication_error');
+            assert.ok(!JSON.stringify(body).includes(token));
+          }
+          assert.equal(up.seen.length, 0, 'no upstream call without the token');
+          assert.equal((await fetch(`${base}/v1/models`, { headers: { ...login, 'x-jev-router-token': token } })).status, 200);
+          assert.equal(up.seen.length, 1);
+          assert.equal(up.seen[0].headers['x-jev-router-token'], undefined, 'the router token stays in the router');
+        });
+      } finally {
+        up.close();
+      }
+    });
+
+    test('other requests behave as before', async () => {
+      await withRouter(exampleConfig(upstream.url), {}, async (base) => {
+        assert.equal((await fetch(`${base}/v1/models`, { headers: { 'anthropic-version': '2023-06-01' } })).status, 404, 'Claude Code');
+        assert.equal((await fetch(`${base}/v1/models`, { method: 'POST', body: '{}' })).status, 404, 'POST');
+        assert.equal((await fetch(`${base}/v1/models/gpt-6-luna`)).status, 404, 'one model');
+        assert.equal((await fetch(`${base}/v1/modelsx`)).status, 404);
+        assert.equal((await fetch(`${base}/healthz`)).status, 200);
+        assert.equal((await fetch(`${base}/v1/models`, { headers: { origin: 'https://evil.example' } })).status, 403, 'Origin check first');
+        const port = new URL(base).port;
+        const foreign = await new Promise((resolve) => {
+          http.get({ host: '127.0.0.1', port, path: '/v1/models', headers: { host: 'evil.example' } }, (r) => resolve(r.statusCode)).end();
+        });
+        assert.equal(foreign, 403, 'Host check first');
+      });
+      const noOpenai = exampleConfig(upstream.url, (c) => delete c.surfaces.openai);
+      await withRouter(noOpenai, {}, async (base) => assert.equal((await fetch(`${base}/v1/models`)).status, 404, 'no openai surface'));
+      const { res } = await route(upstream, exampleConfig(upstream.url), {
+        path: '/v1/responses',
+        body: codex({ effort: 'low' }),
+        headers: pin('fast'),
+      });
+      assert.equal(res.headers.get('x-jev-tier'), 'fast', 'POST /v1/responses still routed');
+    });
   });
 });

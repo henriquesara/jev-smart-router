@@ -16,12 +16,12 @@ OpenAI Codex ───────────►│                       │
                                      ▼
                               Jev classifica
                                      │
-                 ┌───────────────────┼───────────────────┐
-                 ▼                   ▼                   ▼
-               fast              balanced            frontier
-                 │                   │                   │
-                 ▼                   ▼                   ▼
-            modelo + effort     modelo + effort     modelo + effort
+         ┌──────────────────┬────────┴─────────┬──────────────────┐
+         ▼                  ▼                  ▼                  ▼
+       fast             balanced           frontier             deep
+         │                  │                  │                  │
+         ▼                  ▼                  ▼                  ▼
+  modelo + effort    modelo + effort    modelo + effort    modelo + effort
                                      │
                                      ▼
                            requisição ao upstream
@@ -30,11 +30,13 @@ OpenAI Codex ───────────►│                       │
 O mapeamento padrão (`config.example.json`) é:
 
 ```text
-mechanical → fast     → modelo do tier + effort low
+mechanical → fast     → modelo do tier + effort low   (Haiku: sem effort)
 routine    → balanced → modelo do tier + effort medium
 complex    → frontier → modelo do tier + effort high
-deep       → frontier → modelo do tier + effort high
+deep       → deep     → modelo do tier + effort xhigh
 ```
+
+O tier `deep` é opcional; veja [Tier `deep`](#tier-deep) antes de adotá-lo no seu `config.json`.
 
 O router define **o modelo e o reasoning effort** de cada requisição a partir do tier escolhido. Os valores vêm do `config.json` (veja [Effort por tier no router](#effort-por-tier-no-router)).
 
@@ -169,6 +171,14 @@ Não publique esse valor.
 
 Depois feche todas as sessões abertas do Claude Code e abra novamente.
 
+O `env` do `settings.json` **tem precedência** sobre as variáveis do processo. Por isso `ANTHROPIC_BASE_URL=... claude` não troca o router; para testar contra outro router sem alterar o arquivo, passe um settings temporário, que tem precedência maior:
+
+```powershell
+claude -p "Reply with just: ok" --settings .\settings-teste.json
+```
+
+com `{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:4010", "ANTHROPIC_CUSTOM_HEADERS": "x-jev-router-token: ...\nx-jev-tier: balanced"}}`. Ao rodar dentro de outra sessão do Claude Code, remova antes `CLAUDECODE` e `CLAUDE_CODE_CHILD_SESSION` do ambiente.
+
 ---
 
 ## OpenAI Codex
@@ -195,6 +205,22 @@ http_headers = { "x-jev-router-token" = "SEU_JEV_ROUTER_TOKEN" }
 ```
 
 Preserve suas outras opções, plugins, projetos e configurações existentes.
+
+Chaves de nível superior (`model`, `model_provider`, `notify`, ...) precisam vir **antes** de `[model_providers.jev]`: no TOML, tudo o que vem depois de um cabeçalho de tabela pertence a ela. Um `notify = [...]` escrito abaixo de `[model_providers.jev]` vira um campo do provider e o Codex avisa que ele é ignorado.
+
+### Descoberta de modelos (`GET /v1/models`)
+
+O Codex 0.159 consulta `GET {base_url}/models?client_version=...` ao iniciar e grava o campo `models` da resposta **como veio** em `%USERPROFILE%\.codex\models_cache.json`. Esse campo é uma lista de descrições completas de modelo (`slug`, níveis de reasoning, janela de contexto, ferramentas, ...). Uma lista vazia ou incompleta substituiria o cache, então o router nunca monta um catálogo próprio:
+
+- O router repassa o catálogo do upstream do surface `openai` (o backend do ChatGPT, `.../backend-api/codex/models`), usando o login do próprio cliente, como no `/v1/responses`. Só o target do tier padrão (ou o `trusted`) com `trusted: true`, `clientAuth: true` e sem `keyEnv` é usado: nenhuma chave do router é gasta e o login nunca vai para um upstream não confiável.
+- A resposta só é repassada se for `200`, JSON, com `models` não vazio e cada modelo com `slug` (no máximo 4 MB). Ela segue byte a byte, com apenas `ETag`/`X-Models-Etag` como headers do upstream.
+- Qualquer outra resposta (erro, catálogo vazio, formato diferente, upstream fora do ar) vira `404`. O Codex trata `404` como "sem catálogo aqui" e **mantém o cache como estava**.
+- O token do router é exigido como nas demais rotas (`401` sem ele) e não é repassado ao upstream.
+- Pedidos com `anthropic-version` (Claude Code) continuam recebendo `404`, como antes.
+- O log registra só `{event: "models", upstream, status, relayed}`, sem headers nem conteúdo.
+- Limitação: `jev-auto` não está no catálogo oficial, então o Codex mostra `Model metadata for jev-auto not found. Defaulting to fallback metadata`. É esperado; o modelo real é escolhido pelo router.
+
+Antes do patch, o Codex registrava `failed to refresh available models: unexpected status 404` a cada execução. Para ativar: `docker compose up -d --build jev-router`.
 
 Confira:
 
@@ -236,6 +262,10 @@ Live View:
 ```text
 http://127.0.0.1:4100
 ```
+
+O Live View mostra o **effort** de cada requisição junto do modelo (no destaque da rota ativa, nas linhas do feed, nas lanes de sessão e no card do modelo no grafo). O valor vem só do campo `effort` dos eventos `route`/`done` do router e nunca é deduzido do tier. Eventos sem `effort` (tier sem effort configurado, ou logs antigos) mostram `effort: —`. No grafo, o card do modelo da requisição em foco mostra o effort exato dela (`tier → modelo → effort`). Os outros modelos listam os efforts com que rodaram (`effort: high/xhigh`, ou `effort: N levels` acima de dois). A contagem e o custo por effort aparecem no tooltip do modelo.
+
+A linha roxa tracejada da rota em foco segue os cards ativos: cliente → `jev-router` → categoria do Jev → tier → modelo. Ela é desenhada sobre as próprias arestas do grafo (mesmos ids, mesmo `d`, mesmas âncoras de entrada e saída de cada card), na camada abaixo dos cards, então nunca cobre texto. Um tool step (`sticky`) passa pela categoria do prompt que definiu o tier; side calls, `count_tokens`, tags e pins (nenhuma categoria decidiu) usam a aresta que contorna a coluna do Jev. Quando o router mantém um tier diferente do da categoria (ex.: `jev-keep` no ratchet), esse trecho é desenhado entre as mesmas âncoras, já que o grafo não tem essa aresta.
 
 ---
 
@@ -513,7 +543,8 @@ O `Dockerfile` copia `patches\jev-router-1.6.0` e executa `apply.mjs`, que:
 - confere que o pacote instalado é exatamente `@ediri/jev-router@1.6.0`;
 - confere o SHA-256 de `src/router.mjs`, `src/config.mjs` e `src/types.d.ts` originais;
 - exige que cada trecho alterado exista exatamente uma vez;
-- só grava os arquivos depois de todas as verificações, e importa os módulos alterados para validar.
+- só grava os arquivos depois de todas as verificações, e importa os módulos alterados para validar;
+- instala no Live View `ui/effort.js` (effort por requisição) e `ui/route.js` (arestas do grafo e da rota em foco, de uma só fonte).
 
 Qualquer divergência (nova versão, upstream alterado, patch já aplicado) **falha o build** com uma mensagem clara, em vez de gerar comportamento incorreto. O mesmo patch inclui a correção existente do caminho `/backend-api/codex/responses` para o login ChatGPT.
 
@@ -525,9 +556,32 @@ docker compose up -d --build jev-router
 
 Um `config.json` sem nenhum `effort` mantém exatamente o comportamento anterior.
 
-### Limitação: `complex` e `deep`
+### Tier `deep`
 
-O effort é definido por **tier**. Como `complex` e `deep` usam ambos o tier `frontier`, eles recebem o mesmo effort (por exemplo `high`). Para dar `xhigh` só a `deep`, seria preciso um quarto tier (por exemplo `deep` com `effort: "xhigh"`) e mapear `jev.labels.deep` para ele. Isso muda a semântica do roteamento (escalonamento e override de conteúdo sensível passam a ir para o tier mais alto), então avalie também `escalationCeiling: "frontier"`. O exemplo mantém três tiers.
+O effort é definido por **tier**. Com três tiers, `complex` e `deep` caem ambos em `frontier` e recebem o mesmo effort. O `config.example.json` usa um quarto tier, `deep`, só por configuração (nenhuma mudança de código no router; é o mesmo padrão do `anthropic-fable.json` do upstream):
+
+```json
+"tiers": ["fast", "balanced", "frontier", "deep"],
+"policy": { "...": "...", "escalationCeiling": "frontier" },
+"jev": { "options": { "complex": { "tier": "frontier" }, "deep": { "tier": "deep" } } },
+"surfaces": {
+  "anthropic": { "deep": { "model": "claude-opus-5-5", "effort": "xhigh", "...": "..." } },
+  "openai":    { "deep": { "model": "gpt-6-astra",     "effort": "xhigh", "...": "..." } }
+}
+```
+
+Impactos, todos cobertos por testes:
+
+- O Jev só manda para `deep` quando `deep` é a resposta mais provável. Uma resposta incerta (por exemplo `routine` 0.55 / `deep` 0.45) escala no máximo até `frontier`, por causa de `escalationCeiling`. Não existe `accept.deep`: o router não o consulta para o tier mais alto.
+- `sensitiveOverride` envia conteúdo sensível para o **último** tier, que passa a ser `deep` (`xhigh`).
+- No modo `ratchet`, uma sessão que chegou a `deep` fica em `deep` até o `idleResetMinutes`.
+- Toda superfície precisa de um target `deep`; sem ele o router não inicia.
+- `modelPins` não muda: `opus`/`fable` continuam fixando `frontier`.
+- A Live View colore `deep` com a cor de `max`. `watch.ps1` e `benchmark.ps1` continuam medindo só `fast`/`balanced`/`frontier`.
+
+Para adotar no seu `config.json` local, aplique as mesmas quatro mudanças e reinicie o router (`docker compose up -d jev-router`).
+
+Validação real (Claude Code 2.1.286, router de teste isolado, um pedido por tier fixado com `x-jev-tier`): `fast` foi para `claude-haiku-4-5` sem effort; `balanced` para `claude-sonnet-5` com `medium`; `frontier` para `claude-opus-5-5` com `high`; `deep` para `claude-opus-5-5` com `xhigh`. Todos terminaram em `200`. Em `balanced`, os dois primeiros pedidos voltaram `400`, e isso acontece também **sem** effort no target. O Claude Code (que acredita falar com `opus`) envia recursos que `claude-sonnet-5` recusa (`output_config.effort requires a model that supports per-turn effort`, `tool_addition/tool_removal is not supported on this model`), e o próprio cliente repete o pedido sem eles.
 
 ### Recomendação do benchmark
 
@@ -608,7 +662,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\model-lab-effort.tes
 
 O script mostra o total de casos e falhas de cada parte (unidades e integração) e termina com código `1` se algum teste falhar. Os arquivos temporários ficam em `%TEMP%\jev-effort-test-<guid>` e são removidos ao final. Não precisa de `runtime\runtime-paths.json`, credenciais nem rede.
 
-Testes do effort no router (`node:test`): allowlists, reescrita do body por provider, precedência, recusa de configs inválidas e recusas do `apply.mjs` (versão errada, hash divergente). A parte de integração sobe o router patchado contra um upstream falso local, sem credenciais nem chamadas reais. O jeito mais simples é rodar dentro da imagem, sem rede:
+Testes do router patchado (`node:test`): allowlists, reescrita do body por provider, precedência, recusa de configs inválidas, recusas do `apply.mjs` (versão errada, hash divergente), `GET /v1/models` (repasse do catálogo real, nunca vazio, token, rotas que não mudam), effort no Live View, destaque da rota no Live View (mesmas arestas do grafo para cada categoria/tier, troca de modelo e de cliente) e política do tier `deep`. A parte de integração sobe o router patchado contra um upstream falso local, sem credenciais nem chamadas reais. O jeito mais simples é rodar dentro da imagem, sem rede:
 
 ```powershell
 docker run --rm --network none `
@@ -722,7 +776,10 @@ jev-router/
 ├── patches/
 │   └── jev-router-1.6.0/
 │       ├── apply.mjs    (aplicado no build; falha se versão/hash divergirem)
-│       └── effort.mjs   (effort por target)
+│       ├── effort.mjs   (effort por target)
+│       ├── models.mjs   (GET /v1/models para o Codex)
+│       ├── ui-effort.js (Live View: effort por requisição)
+│       └── ui-route.js  (Live View: arestas do grafo e da rota em foco)
 │
 ├── runtime/
 │   └── .gitkeep
