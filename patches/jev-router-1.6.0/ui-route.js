@@ -1,7 +1,8 @@
 // jev-router-route, live view: which edges the flow draws, and which of them a request's route
 // takes. The normal edges and the focused route's highlight both come from here, so the highlight
 // is always drawn over an edge of the graph, entering and leaving each card where the graph's own
-// lines do. Pure functions over node ids: no DOM, no geometry. Installed as ui/route.js by apply.mjs.
+// lines do. Pure functions over node ids: no DOM, no geometry. tierLine names a request's tiers for the
+// decision card. Installed as ui/route.js by apply.mjs.
 
 /**
  * @param {string} from
@@ -82,4 +83,21 @@ export function chainEdges(chain, edges) {
     const id = edgeId(from, to);
     return { id, from, to, drawn: edges.has(id) };
   });
+}
+
+/**
+ * jev-router-downgrade: a request's tiers, kept apart: the tier Jev's answer alone gave, the
+ * session's historical tier and the tier the request ran on (the one its chain goes through).
+ * Empty for a route line that logged neither, as an unpatched router's.
+ * @param {{ tier: string, jevTier?: string, sessionTier?: string }} route
+ * @returns {Array<{ label: string, tier: string }>}
+ */
+export function tierLine(route) {
+  if (!route.jevTier && !route.sessionTier) return [];
+  /** @type {Array<{ label: string, tier: string }>} */
+  const line = [];
+  if (route.jevTier) line.push({ label: 'Jev tier', tier: route.jevTier });
+  if (route.sessionTier) line.push({ label: 'Session tier', tier: route.sessionTier });
+  line.push({ label: 'Effective tier', tier: route.tier });
+  return line;
 }

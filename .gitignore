@@ -9,6 +9,10 @@ config/config.json
 config/config.backup.json
 config/*.backup.json
 
+# Router Settings (router-settings.json, request-downgrade.json legado), gravados pelo router
+config/runtime/*
+!config/runtime/.gitkeep
+
 # ------------------------------------------------------------
 # Wrappers gerados localmente pelo instalador
 # (contêm caminhos específicos da máquina)

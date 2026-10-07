@@ -574,7 +574,7 @@ Impactos, todos cobertos por testes:
 
 - O Jev só manda para `deep` quando `deep` é a resposta mais provável. Uma resposta incerta (por exemplo `routine` 0.55 / `deep` 0.45) escala no máximo até `frontier`, por causa de `escalationCeiling`. Não existe `accept.deep`: o router não o consulta para o tier mais alto.
 - `sensitiveOverride` envia conteúdo sensível para o **último** tier, que passa a ser `deep` (`xhigh`).
-- No modo `ratchet`, uma sessão que chegou a `deep` fica em `deep` até o `idleResetMinutes`.
+- No modo `ratchet`, uma sessão que chegou a `deep` fica em `deep` até o `idleResetMinutes` (o tier da sessão; com `policy.requestDowngrade`, um pedido isolado pode rodar abaixo dele, veja abaixo).
 - Toda superfície precisa de um target `deep`; sem ele o router não inicia.
 - `modelPins` não muda: `opus`/`fable` continuam fixando `frontier`.
 - A Live View colore `deep` com a cor de `max`. `watch.ps1` e `benchmark.ps1` continuam medindo só `fast`/`balanced`/`frontier`.
@@ -582,6 +582,65 @@ Impactos, todos cobertos por testes:
 Para adotar no seu `config.json` local, aplique as mesmas quatro mudanças e reinicie o router (`docker compose up -d jev-router`).
 
 Validação real (Claude Code 2.1.286, router de teste isolado, um pedido por tier fixado com `x-jev-tier`): `fast` foi para `claude-haiku-4-5` sem effort; `balanced` para `claude-sonnet-5` com `medium`; `frontier` para `claude-opus-5-5` com `high`; `deep` para `claude-opus-5-5` com `xhigh`. Todos terminaram em `200`. Em `balanced`, os dois primeiros pedidos voltaram `400`, e isso acontece também **sem** effort no target. O Claude Code (que acredita falar com `opus`) envia recursos que `claude-sonnet-5` recusa (`output_config.effort requires a model that supports per-turn effort`, `tool_addition/tool_removal is not supported on this model`), e o próprio cliente repete o pedido sem eles.
+
+### Downgrade por request (`policy.requestDowngrade`)
+
+No modo `ratchet`, o router guarda o maior tier que a sessão já alcançou. Sem esta opção, todo pedido roda em `max(tier da sessão, tier do Jev)` (hard ratchet): depois de um pedido `complex`, até um pedido mecânico simples continua em `frontier`. Com ela, o ratchet vira memória histórica da sessão, e cada pedido pode descer de forma controlada:
+
+```json
+"policy": {
+  "...": "...",
+  "requestDowngrade": { "enabled": true, "thresholds": { "mechanical": 0.85, "routine": 0.80, "complex": 0.70 } }
+}
+```
+
+- **`sessionTier`** é o maior tier que a sessão já alcançou e nunca diminui (só o `idleResetMinutes` recomeça a sessão). Tag (`#fast`, `#frontier`, …) e pin `x-jev-tier` continuam definindo o tier diretamente, inclusive para baixo: são os únicos overrides explícitos que reduzem o `sessionTier`.
+- **O modelo pedido pelo cliente só sobe ou mantém o `sessionTier`, nunca o reduz.** Um modelo de família acima (ex.: `/model opus` numa sessão `balanced`) continua valendo como troca (`client-model:…`). Um modelo abaixo do `sessionTier` é ignorado como troca e o pedido segue a decisão normal (Jev, `sticky`, `fallback:keep`), como se o modelo não tivesse mudado. Motivo: depois de um turno com `request-downgrade` para Haiku, a resposta vem como `claude-haiku-*` e o `claude --resume` pede esse modelo; antes isso virava `client-model:haiku` e derrubava a sessão para `fast`. Sem estado anterior da sessão, o modelo do cliente continua decidindo o tier como antes. Consequência: `/model haiku` numa sessão `frontier` não reduz mais a sessão; para isso use `#fast` ou `x-jev-tier: fast`.
+- **`effectiveTier`** é o tier em que o pedido roda (header `x-jev-tier`, modelo e effort). Num turno humano novo, com resposta válida do Jev:
+  - se a categoria do Jev tem um threshold e a probabilidade alcança esse threshold, o tier dela fica abaixo do `sessionTier` e o Jev não escalou nem acionou `risk-override` ou `claim-guard`, então `effectiveTier = tier do Jev` (razão `request-downgrade`) e o `sessionTier` não muda;
+  - caso contrário, `effectiveTier = max(sessionTier, tier do Jev)`, que é o comportamento de antes (`jev-keep` ou `upgrade:…`), e o `sessionTier` sobe junto.
+- **Sem decisão nova do Jev, nada desce.** Chamadas de ferramenta e passos do loop de tool, pedidos de background e side, `count_tokens`, `sticky`, timeout ou falha do Jev e `fallback:keep` mantêm o comportamento atual. Timeout e falha voltam para o `sessionTier`.
+- Um pedido `deep` nunca roda abaixo de `deep`, porque `deep` não tem threshold. Uma sessão `deep` pode rodar um pedido `mechanical` muito confiável em `fast`, e o `sessionTier` continua `deep`.
+- Depois de um downgrade, o próximo turno é comparado de novo ao `sessionTier`. Um pedido `complex` volta a `frontier` na hora.
+- A comparação é `probabilidade >= threshold`. Threshold `1.0` (100%) quer dizer "downgrade somente quando confidence = 1.0", não "nunca": o Jev pode responder 1.0. Para desligar o downgrade, use **Request downgrade = OFF** (`enabled: false`).
+- Uma categoria sem threshold nunca desce. Os nomes são categorias do Jev (`jev.options`), não tiers. O router recusa iniciar se a config for inválida: chave desconhecida, `enabled` que não seja booleano ou probabilidade fora de `0..1`.
+- **Ausente ou `enabled: false`:** o hard ratchet de antes, sem nenhuma mudança.
+
+O log de rota (`event: "route"`) passa a trazer:
+- `tier`: o tier efetivo;
+- `session_tier`: o tier da sessão depois da decisão;
+- `jev_tier`: o tier da resposta do Jev, só quando há decisão nova.
+
+Os logs não registram o payload nem segredos. Na Live View, o caminho roxo segue o tier efetivo. O painel da decisão mostra `Jev tier / Session tier / Effective tier` e explica `request downgrade`. A lane da sessão mostra `fast · session frontier` quando os dois tiers diferem.
+
+Testes: `tests/router-downgrade.test.mjs`.
+
+#### Router Settings (Live View)
+
+A Live View não tem login: abre direto e o stream `/events` conecta na hora (com a reconexão normal do `EventSource`). O botão **Router Settings** escolhe, sem restart, o **preset** de `policy.requestDowngrade` em uso. O tier da sessão nunca diminui por causa deste painel.
+
+Requisito: `JEV_ROUTER_SETTINGS_FILE` (no `compose.yaml`: `/config/runtime/router-settings.json`, montagem `./config/runtime` gravável). Sem ele, o painel responde 404 e a Live View segue funcionando. `JEV_ROUTER_UI_TOKEN` não existe mais: se continuar no `config/env`, é ignorado.
+
+Presets embutidos:
+
+| Preset | Request downgrade | mechanical | routine | complex |
+|---|---|---|---|---|
+| `conservative` | ON | 95% | 90% | 80% |
+| `balanced` (padrão) | ON | 85% | 80% | 70% |
+| `aggressive` | ON | 70% | 65% | 55% |
+| `hard-ratchet` | OFF | 85% | 80% | 70% |
+
+Os embutidos podem ser editados (**Save preset**) e voltar aos valores originais (**Reset defaults**), mas não apagados. Presets próprios: **New preset** (nome de 1 a 40 caracteres `A-Z a-z 0-9 . _ -`, sem colidir com outro ignorando maiúsculas), **Save preset** e **Delete preset** (o preset em uso não pode ser apagado). Escolher um preset no menu só preenche o formulário; **Apply** o torna o preset em uso e aplica na hora. Salvar ou resetar o preset em uso também aplica na hora. **Cancel** descarta o formulário. O resumo mostra o efeito, ex.: `mechanical >= 85% -> fast`; quando `policy.accept` eleva o threshold, mostra os dois valores (`mechanical >= 70% configured · 85% effective -> fast`) e o campo ganha a nota `Effective: 85% · limited by policy.accept.fast`. Onde configurado e efetivo são iguais, nada extra aparece. Com Request downgrade OFF, o resumo diz que o downgrade está desligado e nenhum valor efetivo é mostrado.
+
+Como funciona:
+- **Arquivo:** `router-settings.json` tem só `{ "activePreset": "…", "presets": { "<id>": { "enabled": …, "thresholds": { "mechanical": …, "routine": …, "complex": … } } } }`. Sem segredos, ignorado pelo Git. O preset em uso sobrepõe `policy.requestDowngrade` de `config.json`, que nunca é gravado, no start e no `SIGHUP`. `config/env` nunca é lido nem gravado pelo painel.
+- **Migração:** se o arquivo ainda não existe e há um `request-downgrade.json` (formato antigo) na mesma pasta, as regras dele viram o preset próprio `legacy`, em uso. Sem ele, o arquivo nasce com os embutidos e `balanced` em uso. O `request-downgrade.json` não é alterado nem relido depois.
+- **Endpoints:** `GET` e `PATCH /_jev/admin/settings`, sem autenticação. `PATCH` recebe `{ "action": "apply" | "delete" | "reset", "preset": "…" }` ou `{ "action": "save" | "create", "preset": "…", "values": { enabled, thresholds } }`. As respostas trazem só os presets, o preset ativo, os padrões dos embutidos, a regra em uso, `acceptFloors` (tier e `policy.accept` de cada categoria) e `effectiveThresholds` (os thresholds da regra em uso depois do piso; `null` com o downgrade OFF), nunca a config inteira. Os dois últimos são derivados da config carregada a cada leitura: não vão para o arquivo e um `PATCH` que os envie é recusado (400, chave desconhecida). Respostas de erro: 400 (JSON inválido, ação ou chave desconhecida, nome inválido, threshold fora de `0..1`, `enabled` não booleano, apagar um embutido, resetar um preset próprio), 403 (`Host` ou `Origin` de fora), 404 (preset inexistente, ou sem `JEV_ROUTER_SETTINGS_FILE`), 405 (outro método), 409 (nome repetido, apagar o preset em uso, ou o arquivo mudou no disco), 413 (corpo acima de 4 KiB) e 415 (sem `Content-Type: application/json`).
+- **Persistência e hot reload:** o pedido é validado, o arquivo é relido e comparado com a memória, e o novo conteúdo vai para um temporário (fsync), que é relido. Se o preset em uso mudou, o router aplica a nova regra (`server.reload`, mantendo o `sessionTier` de cada sessão) e só então o temporário é renomeado sobre o arquivo final. Se qualquer passo falhar, a regra anterior é restaurada e o temporário apagado: memória e disco nunca divergem.
+- **Localidade:** as portas são publicadas só em `127.0.0.1`. Sem login, quem alcança a porta 4100 pode trocar o preset; a checagem de `Host`/`Origin` só barra páginas de outros sites no navegador. Fora de loopback, o router avisa no start.
+- **Threshold efetivo:** `efetivo = max(threshold, policy.accept[tier da categoria])` (`mechanical -> fast`, `routine -> balanced`, `complex -> frontier`, conforme `jev.options`). O downgrade exige que o Jev tenha escolhido o tier sozinho (razão `jev`), e o `applyPolicy` escala um tier abaixo do seu `policy.accept` sempre que um tier mais capaz tem alguma probabilidade. Com `accept.fast = 0.85`, o `mechanical` de 70% do `aggressive` age como 85%; os valores dos presets não mudam, só a exibição. Os pisos vêm da config carregada: mudar `policy.accept` e recarregar (`SIGHUP` ou restart) muda o que o painel mostra.
+
+Testes: `tests/router-admin.test.mjs` e `tests/router-startup.test.mjs`.
 
 ### Compatibilidade Anthropic por modelo alvo
 
@@ -779,7 +838,8 @@ jev-router/
 │
 ├── config/
 │   ├── config.example.json
-│   └── env.example
+│   ├── env.example
+│   └── runtime/       (Router Settings: router-settings.json, ignorado pelo Git)
 │
 ├── model-lab/
 │   ├── benchmark.ps1
@@ -798,8 +858,10 @@ jev-router/
 │       ├── effort.mjs   (effort por target)
 │       ├── compat.mjs   (compatibilidade Anthropic por modelo alvo)
 │       ├── models.mjs   (GET /v1/models para o Codex)
+│       ├── admin.mjs    (Router Settings: presets e /_jev/admin/settings)
 │       ├── ui-effort.js (Live View: effort por requisição)
-│       └── ui-route.js  (Live View: arestas do grafo e da rota em foco)
+│       ├── ui-route.js  (Live View: arestas do grafo e da rota em foco)
+│       └── ui-settings.js/.css (Live View: painel Router Settings)
 │
 ├── runtime/
 │   └── .gitkeep

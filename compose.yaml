@@ -13,7 +13,13 @@ services:
     volumes:
       - ./config/config.json:/config/config.json:ro
       - ./config/env:/config/env:ro
+      # Router Settings do Live View: presets do request downgrade em router-settings.json
+      # (sem segredos, ignorado pelo Git). Única montagem gravável vinda do host.
+      - ./config/runtime:/config/runtime
       - jev-router-state:/state
+
+    environment:
+      JEV_ROUTER_SETTINGS_FILE: /config/runtime/router-settings.json
 
     security_opt:
       - no-new-privileges:true
