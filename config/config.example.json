@@ -165,6 +165,9 @@
         "url": "https://chatgpt.com/backend-api/codex",
         "model": "gpt-6-luna",
         "effort": "low",
+        "fallbacks": [
+          "gpt-5.6-luna"
+        ],
         "auth": "bearer",
         "clientAuth": true,
         "trusted": true
@@ -173,6 +176,11 @@
         "url": "https://chatgpt.com/backend-api/codex",
         "model": "gpt-6.1-sol",
         "effort": "medium",
+        "fallbacks": [
+          "gpt-6-sol",
+          "gpt-5.6-terra",
+          "gpt-6-luna"
+        ],
         "auth": "bearer",
         "clientAuth": true,
         "trusted": true
@@ -181,6 +189,12 @@
         "url": "https://chatgpt.com/backend-api/codex",
         "model": "gpt-6-astra",
         "effort": "high",
+        "fallbacks": [
+          "gpt-6.1-sol",
+          "gpt-6-sol",
+          "gpt-5.6-terra",
+          "gpt-6-luna"
+        ],
         "auth": "bearer",
         "clientAuth": true,
         "trusted": true
@@ -189,6 +203,12 @@
         "url": "https://chatgpt.com/backend-api/codex",
         "model": "gpt-6-astra",
         "effort": "xhigh",
+        "fallbacks": [
+          "gpt-6.1-sol",
+          "gpt-6-sol",
+          "gpt-5.6-terra",
+          "gpt-6-luna"
+        ],
         "auth": "bearer",
         "clientAuth": true,
         "trusted": true
@@ -197,6 +217,11 @@
         "url": "https://chatgpt.com/backend-api/codex",
         "model": "gpt-6.1-sol",
         "effort": "medium",
+        "fallbacks": [
+          "gpt-6-sol",
+          "gpt-5.6-terra",
+          "gpt-6-luna"
+        ],
         "auth": "bearer",
         "clientAuth": true,
         "trusted": true

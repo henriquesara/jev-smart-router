@@ -2,7 +2,8 @@
 // takes. The normal edges and the focused route's highlight both come from here, so the highlight
 // is always drawn over an edge of the graph, entering and leaving each card where the graph's own
 // lines do. Pure functions over node ids: no DOM, no geometry. tierLine names a request's tiers for the
-// decision card. Installed as ui/route.js by apply.mjs.
+// decision card. fallbackOf and its helpers show a model fallback (jev-router-catalog). Installed as
+// ui/route.js by apply.mjs.
 
 /**
  * @param {string} from
@@ -10,18 +11,19 @@
  */
 export const edgeId = (from, to) => `${from}>${to}`;
 
-/** @typedef {{ from: string, to: string, kind: '' | 'map' | 'bypass', tier: string }} Link */
+/** @typedef {{ from: string, to: string, kind: '' | 'map' | 'bypass' | 'fallback', tier: string }} Link */
 
 /**
  * Every edge of the flow, in the order the original graph added them: router → category, category →
  * its tier and router → tier past Jev (the bypass, only with a category column), then client →
- * router and tier → model.
+ * router and tier → model. fallbackLinks (jev-router-catalog) add tier → the model a fallback ran on,
+ * next to the configured tier → model edge, which stays: the tier still names its preferred model.
  * @param {Iterable<{ id: string, kind: string, key: string }>} nodes
  * @param {{ source: string, optionTier: (option: string) => string | undefined, bypass: boolean,
- *   surfaces: string[], links: Iterable<string> }} opts source is 'router', or 'entry' when the graph has no router card
+ *   surfaces: string[], links: Iterable<string>, fallbackLinks?: Iterable<string> }} opts source is 'router', or 'entry' when the graph has no router card
  * @returns {Link[]}
  */
-export function graphLinks(nodes, { source, optionTier, bypass, surfaces, links }) {
+export function graphLinks(nodes, { source, optionTier, bypass, surfaces, links, fallbackLinks = [] }) {
   const all = [...nodes];
   const has = new Set(all.map((n) => n.id));
   /** @type {Link[]} */
@@ -42,8 +44,25 @@ export function graphLinks(nodes, { source, optionTier, bypass, surfaces, links 
     const [tier, model] = link.split('>');
     if (has.has(`tier:${tier}`) && has.has(`model:${model}`)) out.push({ from: `tier:${tier}`, to: `model:${model}`, kind: 'map', tier });
   }
+  const configured = new Set(out.map((l) => edgeId(l.from, l.to)));
+  for (const link of fallbackLinks) {
+    const [tier, model] = link.split('>');
+    const from = `tier:${tier}`;
+    const to = `model:${model}`;
+    if (has.has(from) && has.has(to) && !configured.has(edgeId(from, to))) {
+      configured.add(edgeId(from, to));
+      out.push({ from, to, kind: 'fallback', tier });
+    }
+  }
   return out;
 }
+
+/**
+ * jev-router-catalog: the tier → model edge a request that ran on a fallback took, as a graphLinks
+ * fallbackLinks entry; undefined for any other request.
+ * @param {{ tier: string, model: string, modelFallback?: boolean }} route
+ */
+export const fallbackLink = (route) => (route.modelFallback && route.tier && route.model ? `${route.tier}>${route.model}` : undefined);
 
 /**
  * @typedef {{ tier: string, model: string, jev?: { ok: boolean, choice: string } }} ChainRoute
@@ -101,3 +120,49 @@ export function tierLine(route) {
   line.push({ label: 'Effective tier', tier: route.tier });
   return line;
 }
+
+/**
+ * @typedef {{ preferredModel: string, modelFallback: boolean, modelFallbackReason: string }} Fallback
+ */
+
+/**
+ * jev-router-catalog: a log line's model fallback. A line without one gets the empty values, so a
+ * request without a fallback shows just its model.
+ * @param {Record<string, unknown>} raw a route or done log line
+ * @returns {Fallback}
+ */
+export function fallbackOf(raw) {
+  const on = raw.model_fallback === true && typeof raw.preferred_model === 'string' && raw.preferred_model !== '';
+  return {
+    preferredModel: on ? /** @type {string} */ (raw.preferred_model) : '',
+    modelFallback: on,
+    modelFallbackReason: on && typeof raw.model_fallback_reason === 'string' ? raw.model_fallback_reason : '',
+  };
+}
+
+/**
+ * The note shown next to the model of a request that ran on a fallback, else ''.
+ * @param {Fallback} f
+ */
+export const fallbackText = (f) => (f.modelFallback ? `fallback from ${f.preferredModel}` : '');
+
+/**
+ * Why, for the note's tooltip.
+ * @param {Fallback} f
+ */
+export function fallbackTip(f) {
+  if (!f.modelFallback) return '';
+  const why =
+    f.modelFallbackReason === 'upstream-unsupported'
+      ? 'the upstream refused it for this ChatGPT account'
+      : "it is not in this account's Codex model catalog";
+  return `${f.preferredModel} is the tier's preferred model, but ${why}. Same tier, same effort.`;
+}
+
+/**
+ * Whether a done line ran on another model than its route line said: the upstream refused the
+ * route's model and the request was sent once more on a fallback.
+ * @param {{ model: string }} route
+ * @param {{ model?: string } & Fallback} done
+ */
+export const rerouted = (route, done) => done.modelFallback && Boolean(done.model) && done.model !== route.model;

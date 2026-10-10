@@ -10,6 +10,8 @@ RUN npm install -g @ediri/jev-router@1.6.0
 # - Live View destaca a rota em foco sobre as proprias arestas do grafo.
 # - Live View sem login: Router Settings com presets do request downgrade, gravados em
 #   JEV_ROUTER_SETTINGS_FILE e aplicados sem restart.
+# - Fallback de modelo openai pelo catalogo real da conta Codex (fallbacks por tier),
+#   com o mesmo cache em memoria do GET /v1/models.
 # O script confere versao, SHA-256 dos arquivos originais e cada trecho alterado;
 # qualquer divergencia falha o build.
 COPY patches/jev-router-1.6.0/ /tmp/jev-patch/

@@ -100,3 +100,22 @@ export function effortBreakdown(efforts, money) {
     })
     .join(' · ');
 }
+
+/**
+ * jev-router-catalog: a request counted on one model that ran on another (the upstream refused the
+ * first and the request was sent again on a fallback). Its count, and its count at its effort, move
+ * to the model it ran on, so each model's effort breakdown lists only what that model served.
+ * @param {{ count: number, efforts: Map<string, EffortStat> }} from
+ * @param {{ count: number, efforts: Map<string, EffortStat> }} to
+ * @param {string} effort
+ */
+export function moveRequest(from, to, effort) {
+  from.count = Math.max(0, from.count - 1);
+  const left = from.efforts.get(effort);
+  if (left) {
+    left.count = Math.max(0, left.count - 1);
+    if (left.count === 0 && left.spend === 0) from.efforts.delete(effort);
+  }
+  to.count += 1;
+  countEffort(to.efforts, effort);
+}

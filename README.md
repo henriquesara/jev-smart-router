@@ -222,6 +222,76 @@ O Codex 0.159 consulta `GET {base_url}/models?client_version=...` ao iniciar e g
 
 Antes do patch, o Codex registrava `failed to refresh available models: unexpected status 404` a cada execução. Para ativar: `docker compose up -d --build jev-router`.
 
+### Fallback de modelo pelo catálogo da conta (`fallbacks`)
+
+O backend do ChatGPT só aceita, para cada conta (e versão do Codex), os modelos do catálogo que ele entrega naquele momento. Um modelo fora dele falha **toda** requisição com `400 {"detail":"The '<modelo>' model is not supported when using Codex with a ChatGPT account."}`. Modelos podem sair e voltar do catálogo; o router se adapta sozinho, sem trocar a config:
+
+- **Preferred model**: o `model` do target do tier (`surfaces.openai.<tier>.model`). É o modelo ideal do tier e nunca é reescrito.
+- **Actual model**: o modelo realmente enviado ao upstream, depois de conferir se o catálogo da conta o tem. Aparece em `x-jev-model`, no campo `model` do log e no Live View.
+- **Catalog fallback**: se o preferred não está no catálogo, o router usa o primeiro de `fallbacks` que esteja, **com o mesmo tier e o mesmo effort**. Quando o preferred volta ao catálogo, a próxima requisição já volta a usá-lo.
+
+```json
+"balanced": {
+  "url": "https://chatgpt.com/backend-api/codex",
+  "model": "gpt-6.1-sol",
+  "effort": "medium",
+  "fallbacks": ["gpt-6-sol", "gpt-5.6-terra", "gpt-6-luna"],
+  ...
+}
+```
+
+Regras da escolha:
+
+- Só para o surface `openai`, só em targets servidos pelo mesmo upstream do catálogo com o login do cliente (`trusted`, `clientAuth`, sem `keyEnv`). Anthropic não é afetado; `fallbacks` em um target Anthropic é erro de config.
+- Um fallback precisa estar no catálogo, **não** ter `visibility: "hide"` e aceitar o effort do tier (`supported_reasoning_levels`). Um preferred escondido (`hide`) ainda é usado, porque foi configurado explicitamente.
+- Nada além do modelo muda: tier, `sessionTier`, tier efetivo, soft/hard ratchet, `reason`, sessão e projeto são os mesmos de sem fallback. O fallback nunca vira `client-model`.
+- Sem catálogo ainda (router recém-iniciado), a requisição espera no máximo 1,5 s pelo primeiro; sem resposta, segue com o preferred.
+
+**Uma recuperação por requisição.** Se o upstream responder exatamente o `400` acima, nomeando o modelo enviado, o router não repassa esse erro: marca o modelo como indisponível para a conta e reenvia **a mesma requisição uma única vez** no próximo fallback válido (nada foi executado pelo upstream, então o reenvio é seguro). Não há retry para `401`, `403`, `429`, `5xx`, timeout/conexão, erro de conteúdo nem qualquer outro `400`. Se o reenvio também falhar, o cliente recebe a resposta como veio.
+
+- **Sem catálogo no momento da recusa** (ex.: primeira requisição após o restart, com o primeiro fetch falhando), o router tenta obter o catálogo por até 1,5 s antes de escolher o modelo do retry, ignorando o backoff de 30 s e reaproveitando um refresh já em andamento. Se o catálogo chegar, o retry vai para o primeiro fallback que a conta realmente tem; se não, vai para o próximo fallback ainda não tentado, como antes. Em qualquer caso, no máximo um retry.
+- **Bloqueio temporário com evidência positiva.** O modelo recusado fica bloqueado para a conta por até 15 min. Se um catálogo obtido depois da recusa voltar a listá-lo, o bloqueio cai na hora e o preferred volta a ser usado na próxima requisição. A exceção é um modelo que o catálogo já listava quando o upstream o recusou: aí o catálogo e o upstream discordam, listar de novo não é evidência nova, e o bloqueio dura os 15 min (evita uma recusa + retry a cada requisição).
+
+**Cache.** `GET /v1/models` e o guard usam a mesma busca ao upstream e o mesmo cache em memória:
+
+- uma entrada por conta (`chatgpt-account-id`, ou o login quando não há conta) e versão do Codex (`client_version`, ou a versão no `User-Agent` `codex_exec/x.y.z`), porque o catálogo muda com a versão;
+- a chave é um HMAC com uma chave aleatória do processo: nem o account id nem o token ficam guardados ou podem ser recuperados dela;
+- só ficam `slug`, `visibility` e níveis de reasoning de cada modelo; nada de instruções, headers ou credenciais, e nada vai para disco (o cache começa vazio a cada restart);
+- fresco por 5 min; de 5 min a 1 h é usado enquanto **um** refresh roda em segundo plano (um por conta/versão, sem stampede); depois de 1 h é descartado; um refresh que falhou só é tentado de novo após 30 s;
+- o refresh envia só `authorization`, `chatgpt-account-id`, `originator` e `user-agent` do cliente; o token do router nunca sai.
+- Cada `GET /v1/models` que o próprio Codex faz ao iniciar também atualiza o cache.
+
+**Log e Live View.** Sem fallback, o log tem só `model`. Com fallback, `route` e `done` trazem:
+
+```json
+{ "model": "gpt-5.6-terra", "preferred_model": "gpt-6.1-sol", "model_fallback": true, "model_fallback_reason": "catalog-unavailable" }
+```
+
+`model_fallback_reason` é `catalog-unavailable` (fora do catálogo) ou `upstream-unsupported` (o upstream recusou; nesse caso o `done` traz também `refused_model`). A resposta ganha o header `x-jev-preferred-model`. Os refreshes do guard aparecem como `{event: "catalog", upstream, status, models}` (só a contagem). No Live View, o destaque da rota e a linha do feed mostram discretamente `gpt-5.6-terra fallback from gpt-6.1-sol`; o tier exibido continua o do tier. No grafo, a aresta configurada `tier → modelo preferred` continua lá, e a rota física real aparece como uma aresta tracejada e mais fraca `tier → modelo do fallback`; o destaque da requisição em foco segue essa aresta. Não é uma nova decisão de tier: é só o modelo físico. Quando houve retry, a requisição (contagem e effort no tooltip do modelo) passa a contar para o modelo que realmente respondeu, não para o recusado.
+
+#### Política de fallback por tier
+
+A ordem de `fallbacks` é **política de configuração**, não uma inferência de capacidade. O catálogo do ChatGPT não informa capacidade relativa: em out/2026 ele trazia, para todos os modelos, `upgrade: null`, `model_specialty: null`, a mesma janela de contexto (272k, até 872k) e níveis de reasoning que se sobrepõem (`gpt-5.6-terra` vai até `ultra`; `gpt-6-luna` e `gpt-5.6-luna` até `max`). `priority` é só a ordem do seletor do Codex. As `description` ("balanced", "fast", "easier tasks") são texto de marketing e não servem para ordenar sozinhas.
+
+Por isso a regra usa só o que **a própria config** afirma sobre cada modelo (qual tier o tem como preferred):
+
+1. Desce no máximo o necessário: modelos que a config atribui a tiers aparecem em ordem decrescente de tier, e nunca um modelo de tier acima.
+2. O modelo que a config atribui ao tier mais baixo (`gpt-6-luna`, o modelo do `fast`, também o mais barato em `prices`) é o último recurso de qualquer tier acima dele: vem depois de todo modelo que a config não classifica.
+3. Entre modelos que a config não classifica (`gpt-6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`), vale a ordem escrita pelo operador. Nenhum ranking de capacidade é inventado entre eles.
+
+Ordem resultante no `config.example.json`:
+
+| Tier | preferred | fallbacks |
+|---|---|---|
+| fast | `gpt-6-luna` | `gpt-5.6-luna` |
+| balanced / trusted | `gpt-6.1-sol` | `gpt-6-sol`, `gpt-5.6-terra`, `gpt-6-luna` |
+| frontier | `gpt-6-astra` | `gpt-6.1-sol`, `gpt-6-sol`, `gpt-5.6-terra`, `gpt-6-luna` |
+| deep | `gpt-6-astra` | `gpt-6.1-sol`, `gpt-6-sol`, `gpt-5.6-terra`, `gpt-6-luna` |
+
+Em frontier/deep, `gpt-5.6-terra` fica antes de `gpt-6-luna` pela regra 2 (o luna é o modelo que a config usa para `fast`), não por se afirmar que o terra é mais capaz. Com o catálogo atual (sem `gpt-6.1-sol`, `gpt-6-sol` e `gpt-6-astra`), balanced, frontier e deep rodam em `gpt-5.6-terra`. Quem preferir outra ordem só precisa mudar a lista; o teste `policy:` em `tests/router-catalog.test.mjs` confere as regras 1 e 2 no exemplo.
+
+**Diferente do model watcher.** O `jev-model-watcher` observa amostras públicas de referência (o config de exemplo do Dirien) para sugerir modelos novos e benchmarks; ele não sabe o que a **sua** conta pode usar e nunca reescreve a config. O fallback de catálogo protege a disponibilidade real da conta Codex em cada requisição, a partir do catálogo que o ChatGPT entrega para o seu login. São funções separadas.
+
 Confira:
 
 ```powershell
@@ -329,6 +399,8 @@ Um modelo descoberto remotamente **não é confiável automaticamente**. O watch
 - comecem com `gpt-` (OpenAI) ou `claude-` (Anthropic)
 
 Providers desconhecidos e nomes fora desse formato são descartados e registrados no log sem ecoar o valor recebido.
+
+O watcher só observa mudanças em fontes públicas de referência. Ele **não** decide se um modelo está disponível para a sua conta: isso é o [fallback de modelo pelo catálogo da conta](#fallback-de-modelo-pelo-catálogo-da-conta-fallbacks), que usa o catálogo real do Codex/ChatGPT a cada requisição. O watcher também não reescreve `config.json`.
 
 ---
 

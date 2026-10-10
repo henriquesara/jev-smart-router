@@ -12,6 +12,9 @@
 //   9. Router Settings: the live view has no sign-in. Its Router Settings pick a preset of
 //      policy.requestDowngrade, kept in a settings file of their own and applied at once (admin.mjs,
 //      ui-settings.js).
+//  10. Catalog-aware model fallback, openai only: a tier whose model is missing from the account's
+//      Codex catalog runs on one of its `fallbacks`, at the same tier and effort; GET /v1/models and
+//      this guard share one catalog fetch and one in-memory cache (models.mjs, ui-route.js).
 //
 // Usage: node apply.mjs <package dir>
 //
@@ -45,6 +48,21 @@ const EDITS = {
     [
       "import { applyPolicy, buildState, JevClient } from './jev.mjs';\n",
       "import { applyPolicy, buildState, JevClient } from './jev.mjs';\nimport { applyEffort, effortFor } from './effort.mjs';\nimport { normalizeForTarget } from './compat.mjs';\nimport { CATALOG_HEADERS, MAX_CATALOG_BYTES, catalogBody, catalogPath, catalogTarget } from './models.mjs';\n" +
+        "import { randomBytes } from 'node:crypto';\n" +
+        'import {\n' +
+        '  COLD_WAIT_MS,\n' +
+        '  RETRY_CATALOG_WAIT_MS,\n' +
+        '  agentVersion,\n' +
+        '  catalogIdentity,\n' +
+        '  catalogModels,\n' +
+        '  catalogRequestHeaders,\n' +
+        '  clientVersion,\n' +
+        '  createCatalogCache,\n' +
+        '  fallbackFields,\n' +
+        '  isUnsupportedModel,\n' +
+        '  responseHead,\n' +
+        '  selectModel,\n' +
+        "} from './models.mjs';\n" +
         "import { PROJECT_HEADERS, isLoopbackHost, projectFields, takeProject } from './project.mjs';\n",
     ],
     // 1. ChatGPT backend path.
@@ -76,15 +94,34 @@ const EDITS = {
         '    const target = catalogTarget(cfg.surfaces.openai, cfg.defaultTier);\n' +
         "    if (!target) return fail(res, 404, 'No model catalog for GET /v1/models', 'openai');\n" +
         '    const host = new URL(target.url).host;\n' +
+        "    const { status, body, relayed } = await loadCatalog(target, req.url ?? '', upstreamHeaders(req, target, env));\n" +
+        "    log({ ts: new Date().toISOString(), event: 'models', ...projectFields(req), upstream: host, status, relayed: body !== undefined });\n" +
+        "    if (body === undefined) return fail(res, 404, `No model catalog from ${host} (status ${status || 'none'})`, 'openai');\n" +
+        "    // jev-router-catalog: the model guard keeps the slugs of the catalog Codex just got.\n" +
+        '    const identity = catalogIdentity(req.headers, catalogSecret);\n' +
+        '    const models = catalogModels(body);\n' +
+        "    if (identity && models) catalogs.record(identity, clientVersion(req.url ?? '') ?? '', models);\n" +
+        "    res.writeHead(200, { ...relayed, 'content-type': 'application/json', 'cache-control': 'no-store' });\n" +
+        '    res.end(body);\n' +
+        '  }\n\n' +
+        '  /**\n' +
+        '   * jev-router-catalog: one fetch of the upstream catalog, for GET /v1/models and for the model\n' +
+        '   * guard alike. `body` is the catalog as received, only when it holds models (catalogBody).\n' +
+        '   * @param {Target} target\n' +
+        '   * @param {string} reqUrl the path and query, as a client would send them to the router\n' +
+        '   * @param {Record<string, string | string[]>} headers\n' +
+        '   * @returns {Promise<{ status: number, body: string | undefined, relayed: Record<string, string> }>}\n' +
+        '   */\n' +
+        '  async function loadCatalog(target, reqUrl, headers) {\n' +
         '    /** @type {string | undefined} */\n' +
         '    let body;\n' +
         '    /** @type {Record<string, string>} */\n' +
         '    const relayed = {};\n' +
         '    let status = 0;\n' +
         '    try {\n' +
-        "      const upstream = await fetchImpl(target.url + catalogPath(target.url, req.url ?? ''), {\n" +
+        '      const upstream = await fetchImpl(target.url + catalogPath(target.url, reqUrl), {\n' +
         "        method: 'GET',\n" +
-        '        headers: upstreamHeaders(req, target, env),\n' +
+        '        headers,\n' +
         '        signal: AbortSignal.timeout(15_000),\n' +
         "        redirect: 'error',\n" +
         '      });\n' +
@@ -105,10 +142,78 @@ const EDITS = {
         '    } catch {\n' +
         '      body = undefined;\n' +
         '    }\n' +
-        "    log({ ts: new Date().toISOString(), event: 'models', ...projectFields(req), upstream: host, status, relayed: body !== undefined });\n" +
-        "    if (body === undefined) return fail(res, 404, `No model catalog from ${host} (status ${status || 'none'})`, 'openai');\n" +
-        "    res.writeHead(200, { ...relayed, 'content-type': 'application/json', 'cache-control': 'no-store' });\n" +
-        '    res.end(body);\n' +
+        '    return { status, body, relayed };\n' +
+        '  }\n\n' +
+        '  /**\n' +
+        "   * jev-router-catalog: the model an openai request runs on. The tier's model (preferred) while the\n" +
+        "   * account's catalog has it, else the first of the target's fallbacks that it has; the tier, its\n" +
+        '   * effort and the session stay as decided. Only for a target served by the catalog\'s upstream with\n' +
+        "   * the client's login. A stale catalog is used while one refresh runs in the background; with none\n" +
+        '   * yet, the request waits for the first at most COLD_WAIT_MS, then runs on the preferred model.\n' +
+        '   * @param {IncomingMessage} req\n' +
+        '   * @param {Surface} surface\n' +
+        '   * @param {Target} target\n' +
+        '   * @param {boolean} countOnly\n' +
+        '   */\n' +
+        '  async function pickModel(req, surface, target, countOnly) {\n' +
+        "    if (surface !== 'openai' || countOnly) return undefined;\n" +
+        '    const source = catalogTarget(cfg.surfaces.openai, cfg.defaultTier);\n' +
+        '    if (!source || source.url !== target.url || target.trusted !== true || target.clientAuth !== true || target.keyEnv) return undefined;\n' +
+        '    const identity = catalogIdentity(req.headers, catalogSecret);\n' +
+        '    if (!identity) return undefined;\n' +
+        "    const version = agentVersion(req.headers['user-agent']);\n" +
+        '    // Only the login and who the client is, for the refresh alone: never kept.\n' +
+        '    const headers = catalogRequestHeaders(req.headers);\n' +
+        '    const host = new URL(source.url).host;\n' +
+        '    const refresh = (/** @type {string} */ v, force = false) =>\n' +
+        '      catalogs.refresh(\n' +
+        '        identity,\n' +
+        '        v,\n' +
+        '        async () => {\n' +
+        "          const r = await loadCatalog(source, v ? `/v1/models?client_version=${v}` : '/v1/models', headers);\n" +
+        '          const models = r.body === undefined ? undefined : catalogModels(r.body);\n' +
+        "          log({ ts: new Date().toISOString(), event: 'catalog', ...projectFields(req), upstream: host, status: r.status, models: models?.size ?? 0 });\n" +
+        '          return models;\n' +
+        '        },\n' +
+        '        { force },\n' +
+        '      );\n' +
+        '    let cached = catalogs.get(identity, version);\n' +
+        '    if (!cached && version) {\n' +
+        '      await Promise.race([refresh(version), new Promise((resolve) => setTimeout(resolve, COLD_WAIT_MS).unref())]);\n' +
+        '      cached = catalogs.get(identity, version);\n' +
+        "    } else if (cached && (cached.state === 'stale' || (version !== undefined && cached.version !== version))) {\n" +
+        '      void refresh(version ?? cached.version);\n' +
+        '    }\n' +
+        '    const fallbacks = target.fallbacks ?? [];\n' +
+        '    const effort = target.effort ?? undefined;\n' +
+        '    const pick = selectModel({ preferred: target.model, fallbacks, effort, models: cached?.models, unavailable: catalogs.unavailable(identity) });\n' +
+        '    // For retryModel, once the upstream refused a model: a refresh past a recent failure, while this request lasts.\n' +
+        '    const refreshNow = version ? () => refresh(version, true) : undefined;\n' +
+        '    return { ...pick, preferred: target.model, fallbacks, effort, identity, version, tried: new Set([pick.model]), refresh: refreshNow };\n' +
+        '  }\n\n' +
+        '  /**\n' +
+        '   * jev-router-catalog: the model to send a request with once more, after the upstream refused\n' +
+        "   * `model` as not available to this ChatGPT account (isUnsupportedModel, nothing else). The model\n" +
+        '   * is held back for the account. With no catalog yet, the request waits up to RETRY_CATALOG_WAIT_MS\n' +
+        '   * for one, so its single retry goes to a fallback the account has; without one, to the next\n' +
+        '   * fallback untried. Undefined when no fallback is left to try.\n' +
+        '   * @param {NonNullable<Awaited<ReturnType<typeof pickModel>>>} pick\n' +
+        '   * @param {string} model\n' +
+        '   * @param {number} status\n' +
+        '   * @param {string} text the start of the error body\n' +
+        '   * @returns {Promise<string | undefined>}\n' +
+        '   */\n' +
+        '  async function retryModel(pick, model, status, text) {\n' +
+        '    if (!isUnsupportedModel(status, text, model)) return undefined;\n' +
+        '    let cached = catalogs.get(pick.identity, pick.version);\n' +
+        '    catalogs.markUnavailable(pick.identity, model, cached?.models.has(model) ?? false);\n' +
+        '    if (!cached && pick.refresh) {\n' +
+        '      await Promise.race([pick.refresh(), new Promise((resolve) => setTimeout(resolve, RETRY_CATALOG_WAIT_MS).unref())]);\n' +
+        '      cached = catalogs.get(pick.identity, pick.version);\n' +
+        '    }\n' +
+        '    const unavailable = new Set([...catalogs.unavailable(pick.identity), ...pick.tried]);\n' +
+        '    const next = selectModel({ preferred: pick.preferred, fallbacks: pick.fallbacks, effort: pick.effort, models: cached?.models, unavailable });\n' +
+        '    return next.fallback && !pick.tried.has(next.model) ? next.model : undefined;\n' +
         '  }\n\n' +
         '  /** @param {ServerResponse} res */\n  function health(res) {\n',
     ],
@@ -322,11 +427,86 @@ const EDITS = {
         '      jev_tier: decision.jevTier,\n' +
         '      reason: decision.reason,\n',
     ],
+    // 10. Catalog-aware model fallback (models.mjs): after the tier is decided, an openai request runs
+    // on the tier's model while the account's Codex catalog has it, else on a fallback of the tier;
+    // an upstream that refuses the model for the ChatGPT account gets the request once more. Only the
+    // model changes: the decision, the session entry and the effort are those of the tier. Several
+    // anchors are text written by the edits above.
+    [
+      '  // Numbers each request, so its `route` and `done` log entries can be paired.\n  let requests = 0;\n',
+      '  // Numbers each request, so its `route` and `done` log entries can be paired.\n  let requests = 0;\n' +
+        "  // jev-router-catalog: the account catalogs the model guard has seen, and the key of their names.\n" +
+        '  const catalogs = createCatalogCache();\n' +
+        '  const catalogSecret = randomBytes(32);\n',
+    ],
+    [
+      '    const target = decision.trustedOnly && !chosen.trusted ? targets.trusted : chosen;\n',
+      '    const routed = decision.trustedOnly && !chosen.trusted ? targets.trusted : chosen;\n' +
+        "    // jev-router-catalog: the tier's model, or its fallback when the account's catalog lacks it.\n" +
+        '    const pick = await pickModel(req, surface, routed, countOnly);\n' +
+        '    const target = pick?.fallback ? { ...routed, model: pick.model } : routed;\n',
+    ],
+    [
+      "    if (effort) shown['x-jev-effort'] = effort;\n",
+      "    if (effort) shown['x-jev-effort'] = effort;\n" + "    if (pick?.fallback) shown['x-jev-preferred-model'] = pick.preferred;\n",
+    ],
+    ['      model: target.model,\n      effort,\n      upstream: host,\n', '      model: target.model,\n      ...fallbackFields(pick),\n      effort,\n      upstream: host,\n'],
+    [
+      '    const status = await relay(req, res, { id, target, surface, session, shown, signal, startedAt, ...outgoing });\n',
+      '    const status = await relay(req, res, { id, target, surface, session, shown, signal, startedAt, ...outgoing, pick });\n',
+    ],
+    [
+      '  async function relay(req, res, { id, target, surface, session, shown, signal, startedAt, body, redacted, capped, folded, effort }) {\n',
+      '  async function relay(req, res, { id, target, surface, session, shown, signal, startedAt, body, redacted, capped, folded, effort, pick }) {\n' +
+        '    /** @type {string | undefined} the model the upstream refused, when the request was sent again */\n' +
+        '    let refused;\n',
+    ],
+    [
+      '      result = await forward(req, res, target, body, shown, signal, env, surface);\n',
+      '      /** @type {string | undefined} */\n' +
+        '      let retry;\n' +
+        '      const sentPick = pick;\n' +
+        '      const recover = sentPick\n' +
+        '        ? async (/** @type {number} */ status, /** @type {string} */ text) => (retry = await retryModel(sentPick, target.model, status, text)) !== undefined\n' +
+        '        : undefined;\n' +
+        '      result = await forward(req, res, target, body, shown, signal, env, surface, recover);\n' +
+        '      if (result.retry && retry && sentPick) {\n' +
+        "        // jev-router-catalog: the upstream refused the model for this ChatGPT account and ran nothing;\n" +
+        '        // the same request goes once more, on the next fallback of the same tier and effort.\n' +
+        '        refused = target.model;\n' +
+        '        sentPick.tried.add(retry);\n' +
+        "        pick = { ...sentPick, model: retry, fallback: true, reason: 'upstream-unsupported' };\n" +
+        '        target = { ...target, model: retry };\n' +
+        '        body = { ...body, model: retry };\n' +
+        "        shown['x-jev-model'] = retry;\n" +
+        "        shown['x-jev-preferred-model'] = sentPick.preferred;\n" +
+        '        result = await forward(req, res, target, body, shown, signal, env, surface);\n' +
+        '      }\n',
+    ],
+    [
+      '      model: target.model,\n      effort,\n      compat: result.compat,\n      ms: elapsed(startedAt),\n',
+      '      model: target.model,\n      ...fallbackFields(pick),\n      refused_model: refused,\n      effort,\n      compat: result.compat,\n      ms: elapsed(startedAt),\n',
+    ],
+    [
+      'async function forward(req, res, target, body, shown, signal, env, surface) {\n',
+      'async function forward(req, res, target, body, shown, signal, env, surface, recover) {\n',
+    ],
+    [
+      '  res.writeHead(upstream.status, { ...Object.fromEntries([...upstream.headers].filter(([n]) => !DROP_RESPONSE.has(n))), ...shown });\n',
+      "  // jev-router-catalog: an error that recover() takes up is not relayed: the caller sends the request\n" +
+        '  // again. Only a 400, whose start is read from a clone; anything else streams as before.\n' +
+        '  if (recover && upstream.status === 400 && (await recover(upstream.status, await responseHead(upstream)))) {\n' +
+        '    await upstream.body?.cancel().catch(() => undefined);\n' +
+        "    return { status: upstream.status, bytes: 0, sha256: '', usage: undefined, aborted: signal.aborted, broken: false, retry: true };\n" +
+        '  }\n' +
+        '  res.writeHead(upstream.status, { ...Object.fromEntries([...upstream.headers].filter(([n]) => !DROP_RESPONSE.has(n))), ...shown });\n',
+    ],
   ],
   'src/config.mjs': [
     [
       "import { homedir } from 'node:os';\n",
-      "import { homedir } from 'node:os';\nimport { effortProblems } from './effort.mjs';\nimport { downgradeProblems } from './downgrade.mjs';\n",
+      "import { homedir } from 'node:os';\nimport { effortProblems } from './effort.mjs';\nimport { downgradeProblems } from './downgrade.mjs';\n" +
+        "import { fallbackProblems } from './models.mjs';\n",
     ],
     // 8. Request downgrade: its thresholds name Jev's categories, known only once jev is checked.
     [
@@ -339,6 +519,7 @@ const EDITS = {
       '    for (const [name, target] of Object.entries(targets)) {\n' +
         '      checkTarget(target, `surfaces.${surface}.${name}`, need);\n' +
         '      for (const problem of effortProblems(surface, target ?? {}, `surfaces.${surface}.${name}`)) need(false, problem);\n' +
+        '      for (const problem of fallbackProblems(surface, target ?? {}, `surfaces.${surface}.${name}`)) need(false, problem);\n' +
         '    }\n',
     ],
   ],
@@ -357,6 +538,11 @@ const EDITS = {
       '  /** Fields the upstream rejects, as dotted paths such as `output_config.effort`. */\n',
       '  /** Reasoning effort the router sends, over the client\'s (jev-router-effort patch). Values per surface: see src/effort.mjs. */\n' +
         '  effort?: string | null;\n' +
+        '  /**\n' +
+        "   * jev-router-catalog, openai only: models to run on, in order, when the account's Codex catalog\n" +
+        "   * lacks `model` (the preferred one). Same tier and effort; the preferred model wins again once listed.\n" +
+        '   */\n' +
+        '  fallbacks?: string[];\n' +
         '  /** Fields the upstream rejects, as dotted paths such as `output_config.effort`. */\n',
     ],
     // 8. Request downgrade (downgrade.mjs).
@@ -497,7 +683,7 @@ const EDITS = {
   'ui/app.js': [
     [
       "const SVG_NS = 'http://www.w3.org/2000/svg';\n",
-      "import { countEffort, effortBreakdown, effortOf, effortText, effortTip, modelEffortLine, spendEffort } from './effort.js';\n" +
+      "import { countEffort, effortBreakdown, effortOf, effortText, effortTip, modelEffortLine, moveRequest, spendEffort } from './effort.js';\n" +
         "import { chainEdges, edgeId, graphLinks, routeChain as routeCards } from './route.js';\n\n" +
         "const SVG_NS = 'http://www.w3.org/2000/svg';\n",
     ],
@@ -717,7 +903,14 @@ const EDITS = {
         '  const lane = box.top + box.content + 16;\n' +
         '  // Router → category → tier, the bypass past the categories, client → router and tier → model:\n' +
         "  // each edge leaves its card's right side and enters the next card's left side.\n" +
-        '  const links = graphLinks(nodes.values(), { source: source.id, optionTier, bypass: optionCol !== undefined, surfaces: m.surfaces, links: m.links });\n' +
+        '  const links = graphLinks(nodes.values(), {\n' +
+        '    source: source.id,\n' +
+        '    optionTier,\n' +
+        '    bypass: optionCol !== undefined,\n' +
+        '    surfaces: m.surfaces,\n' +
+        '    links: m.links,\n' +
+        '    fallbackLinks,\n' +
+        '  });\n' +
         '  for (const link of links) {\n' +
         '    const from = nodes.get(link.from);\n' +
         '    const a = from ? rightOf(from) : source.point;\n' +
@@ -952,6 +1145,117 @@ const EDITS = {
       "  const source = new EventSource(viewToken === undefined ? '/events' : `/events?token=${encodeURIComponent(viewToken)}`);\n",
       "  const source = new EventSource('/events');\n",
     ],
+    // 10. Catalog fallback: a request that ran on a fallback shows "fallback from <preferred>" next to
+    // its model, on the decision card and its feed row. The tier shown stays the request's tier.
+    [
+      "import { chainEdges, edgeId, graphLinks, routeChain as routeCards, tierLine } from './route.js';\n",
+      'import {\n' +
+        '  chainEdges,\n' +
+        '  edgeId,\n' +
+        '  fallbackLink,\n' +
+        '  fallbackOf,\n' +
+        '  fallbackText,\n' +
+        '  fallbackTip,\n' +
+        '  graphLinks,\n' +
+        '  rerouted,\n' +
+        '  routeChain as routeCards,\n' +
+        '  tierLine,\n' +
+        "} from './route.js';\n",
+    ],
+    [
+      ' *   project: string, projectId: string, instanceId: string, sessionTier: string, jevTier: string }} RouteEvent\n',
+      " *   project: string, projectId: string, instanceId: string, sessionTier: string, jevTier: string } & import('./route.js').Fallback} RouteEvent\n",
+    ],
+    [
+      ' *   effort: string, ms: number | undefined, usage: Usage | undefined,',
+      ' *   effort: string, preferredModel: string, modelFallback: boolean, modelFallbackReason: string, ms: number | undefined, usage: Usage | undefined,',
+    ],
+    [
+      "    model: str(raw.model, '?'),\n    effort: effortOf(raw),\n    ...projectOf(raw),\n",
+      "    model: str(raw.model, '?'),\n    ...fallbackOf(raw),\n    effort: effortOf(raw),\n    ...projectOf(raw),\n",
+    ],
+    ['    model: str(raw.model),\n    effort: effortOf(raw),\n    ms: num(raw.ms),\n', '    model: str(raw.model),\n    ...fallbackOf(raw),\n    effort: effortOf(raw),\n    ms: num(raw.ms),\n'],
+    [
+      "function effortEl(effort) {\n  const el = h('span', 'effort', `effort: ${effortText(effort)}`);\n  el.title = effortTip(effort);\n  return el;\n}\n",
+      "function effortEl(effort) {\n  const el = h('span', 'effort', `effort: ${effortText(effort)}`);\n  el.title = effortTip(effort);\n  return el;\n}\n\n" +
+        '/**\n' +
+        ' * jev-router-catalog: "fallback from <preferred model>" after the model of a request that ran on a\n' +
+        " * fallback; hidden for the others.\n" +
+        " * @param {import('./route.js').Fallback} route\n" +
+        ' */\n' +
+        'function fallbackEl(route) {\n' +
+        "  const el = h('span', 'fallback', fallbackText(route));\n" +
+        '  el.title = fallbackTip(route);\n' +
+        '  el.hidden = !route.modelFallback;\n' +
+        '  return el;\n' +
+        '}\n\n' +
+        '/**\n' +
+        ' * jev-router-catalog: tier>model edges of the fallbacks seen, drawn faintly next to the configured\n' +
+        ' * tier → preferred model edge, which stays.\n' +
+        ' * @type {Set<string>}\n' +
+        ' */\n' +
+        'const fallbackLinks = new Set();\n\n' +
+        '/** @param {RouteRec} rec */\n' +
+        'function noteFallback(rec) {\n' +
+        '  const link = fallbackLink(rec.route);\n' +
+        '  if (!link || fallbackLinks.has(link)) return;\n' +
+        '  fallbackLinks.add(link);\n' +
+        "  schedule('layout');\n" +
+        '}\n',
+    ],
+    [
+      "    effortEl(route.effort),\n  );\n  dom.heroRoute.title = `${route.model} on ${route.upstream} · effort ${effortText(route.effort)}`;\n",
+      '    effortEl(route.effort),\n    fallbackEl(route),\n  );\n' +
+        "  dom.heroRoute.title = `${route.model} on ${route.upstream} · effort ${effortText(route.effort)}${route.modelFallback ? ` · ${fallbackText(route)}` : ''}`;\n",
+    ],
+    [
+      "    effortEl(route.effort),\n  );\n  const res = h('span', 'res');\n",
+      "    effortEl(route.effort),\n    fallbackEl(route),\n  );\n  const res = h('span', 'res');\n",
+    ],
+    [
+      '/** @param {DoneEvent} ev */\nfunction applyDone(ev) {\n',
+      '/**\n' +
+        ' * jev-router-catalog: the upstream refused the model of a route line and the request ran on a\n' +
+        ' * fallback, which its done line names: the card, the feed row and the session show that model.\n' +
+        ' * @param {RouteRec} rec\n' +
+        ' * @param {DoneEvent} ev\n' +
+        ' */\n' +
+        'function reroute(rec, ev) {\n' +
+        '  const before = rec.route.model;\n' +
+        '  rec.route = {\n' +
+        '    ...rec.route,\n' +
+        '    model: ev.model,\n' +
+        '    preferredModel: ev.preferredModel,\n' +
+        '    modelFallback: true,\n' +
+        '    modelFallbackReason: ev.modelFallbackReason,\n' +
+        '  };\n' +
+        '  // The request, and its count at its effort, belong to the model that served it.\n' +
+        '  moveRequest(modelStat(before), modelStat(ev.model), rec.route.effort);\n' +
+        '  const session = state.sessions.get(rec.route.session);\n' +
+        '  if (session?.model === before) session.model = ev.model;\n' +
+        "  const main = rec.cell?.parentElement?.querySelector('.row-main');\n" +
+        "  main?.querySelector('.model')?.replaceChildren(shortModel(ev.model));\n" +
+        "  main?.querySelector('.fallback')?.replaceWith(fallbackEl(rec.route));\n" +
+        '  noteSeen(rec);\n' +
+        '  noteFallback(rec);\n' +
+        "  schedule('hero', 'graph', 'sessions');\n" +
+        '}\n\n' +
+        '/** @param {DoneEvent} ev */\nfunction applyDone(ev) {\n',
+    ],
+    [
+      '  if (rec && !rec.done) {\n    rec.done = ev;\n    settle(rec);\n    dirtyRecs.add(rec);\n  }\n',
+      '  if (rec && !rec.done) {\n    rec.done = ev;\n    settle(rec);\n    dirtyRecs.add(rec);\n' +
+        '    if (rerouted(rec.route, ev)) reroute(rec, ev);\n' +
+        '  }\n',
+    ],
+    ['  remember(rec);\n  noteSeen(rec);\n  tally(rec);\n', '  remember(rec);\n  noteSeen(rec);\n  noteFallback(rec);\n  tally(rec);\n'],
+    // A model first seen on a fallback is no configured tier → model edge: it is drawn as the faint
+    // fallback edge (graphLinks' fallbackLinks), not as a solid one.
+    [
+      "    if (tiers.includes(seen.tier) && seen.tier !== 'side') links.add(`${seen.tier}>${model}`);\n",
+      "    const seenLink = `${seen.tier}>${model}`;\n" +
+        "    if (tiers.includes(seen.tier) && seen.tier !== 'side' && !fallbackLinks.has(seenLink)) links.add(seenLink);\n",
+    ],
   ],
   // 9. The Router Settings panel (settings.js): presets of the request downgrade, open to whoever
   // reaches the view.
@@ -1149,6 +1453,14 @@ const EDITS = {
         '.hero-tiers {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 6px 14px;\n  margin-top: 8px;\n  font-size: 12px;\n  color: var(--muted);\n}\n\n' +
         '.hero-tiers .tier-item {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  white-space: nowrap;\n}\n',
     ],
+    [
+      '.hero-tiers .tier-item {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  white-space: nowrap;\n}\n',
+      '.hero-tiers .tier-item {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  white-space: nowrap;\n}\n\n' +
+        '/* jev-router-catalog: the preferred model a fallback replaced, next to the model. */\n' +
+        '.hero-route .fallback,\n.row .fallback {\n  font: 11px var(--mono);\n  font-style: italic;\n  color: var(--muted);\n  white-space: nowrap;\n}\n\n' +
+        '/* jev-router-catalog: tier → the model a fallback ran on, beside the configured tier → model edge. */\n' +
+        '.edge.fallback {\n  stroke-dasharray: 3 4;\n  stroke-opacity: 0.3;\n}\n',
+    ],
   ],
 };
 
@@ -1216,4 +1528,4 @@ await import(pathToFileURL(join(pkgDir, 'ui/route.js')).href);
 await import(pathToFileURL(join(pkgDir, 'ui/project.js')).href);
 await import(pathToFileURL(join(pkgDir, 'ui/settings.js')).href);
 await import(pathToFileURL(join(pkgDir, 'src/cli.mjs')).href);
-console.log(`jev-router patch: ${VERSION} patched (chatgpt-path, effort, models, live-view effort and route, anthropic compat, project, request downgrade, router settings)`);
+console.log(`jev-router patch: ${VERSION} patched (chatgpt-path, effort, models, live-view effort and route, anthropic compat, project, request downgrade, router settings, catalog fallback)`);
